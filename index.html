@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>MR-CAD (BREP)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <div id="oc-loading-overlay">
+    <div id="oc-loading-box">
+      <div id="oc-loading-title">BREP-Kernel wird geladen…</div>
+      <div id="oc-loading-detail">OpenCascade (WASM, ~10 MB) wird initialisiert. Das dauert beim ersten Mal je nach Rechner ein paar Sekunden.</div>
+    </div>
+  </div>
+
+  <div id="toolbar">
+    <div class="toolbar-row">
+      <div class="logo">MR-CAD (BREP)</div>
+      <div class="group">
+        <button id="tool-select" class="tool" title="Form(en) auswählen und verschieben. Strg+Klick: mehrere Formen zur Auswahl hinzufügen/entfernen">↖ Auswahl</button>
+        <button id="tool-dimension" class="tool" title="Auf eine Linie oder einen Kreis klicken, um Länge/Radius einzugeben">📏 Maße</button>
+        <button id="tool-origin" class="tool" title="Eckpunkt oder Mittelpunkt anklicken, um ihn als neuen Ursprung (0,0) zu setzen">⌂ Ursprung setzen</button>
+        <button id="tool-point" class="tool" title="Eckpunkte einer Linienform oder den Mittelpunkt einer Form anklicken, um die Welt-Koordinaten anzuzeigen und zu bearbeiten">⌖ Punkte</button>
+        <button id="tool-edge" class="tool" title="Linie einer Linienform anklicken (nahe einer Ecke), um dort einen Rundungsradius einzugeben">⌒ Linien</button>
+      </div>
+      <div class="group">
+        <button id="btn-undo" title="Letzten Punkt / letzte Form entfernen">↩ Rückgängig</button>
+        <button id="btn-clear" title="Skizze komplett löschen">🗑 Skizze leeren</button>
+      </div>
+      <div class="group">
+        <label>Snap-Raster
+          <input type="number" id="grid-size" value="10" min="1" step="1" style="width:50px">
+          <input type="checkbox" id="grid-on" checked>
+        </label>
+      </div>
+      <div class="group">
+        <label title="Beim Linien-Tool wird der Winkel zum vorherigen Punkt auf Vielfache dieses Werts eingerastet">Winkel-Raster
+          <input type="number" id="angle-step" value="45" min="1" max="180" step="1" style="width:45px">
+          <input type="checkbox" id="angle-on" checked>
+        </label>
+      </div>
+      <div class="group">
+        <label title="Statt die Länge auf Vielfache des Snap-Rasters einzurasten, läuft die Linie bis zum nächsten tatsächlichen Rasterpunkt in ihrer Richtung (z.B. bei 45° die Diagonale eines Rasterfelds, also Wurzel(2) mal die Rastergröße)">Rasterdistanz-Modus
+          <input type="checkbox" id="raster-distance-on">
+        </label>
+      </div>
+      <div class="group">
+        <span id="zoom-label" style="color:#aaa; font-size:12px;">Zoom: 100%</span>
+        <button id="btn-reset-view" title="Ansicht zurücksetzen (100%, keine Verschiebung)">⤢ Ansicht</button>
+      </div>
+      <div class="group section-divider">
+        <button id="btn-save-project" title="Skizze, Extrusion und Flächen-Features als bearbeitbare Projektdatei speichern">💾 Projekt speichern</button>
+        <button id="btn-load-project" title="Zuvor gespeicherte Projektdatei laden">📂 Projekt öffnen</button>
+        <input type="file" id="load-project-input" accept=".mrcad,.json" style="display:none">
+      </div>
+    </div>
+    <div class="toolbar-row">
+      <div class="group">
+        <button id="tool-line" class="tool active" title="Linien zeichnen: klicken um Punkte zu setzen, Doppelklick oder Enter zum Schließen">✎ Linie</button>
+        <button id="tool-circle" class="tool" title="Kreis zeichnen: klicken für Mittelpunkt, ziehen für Radius">○ Kreis</button>
+        <button id="tool-rect" class="tool" title="Rechteck zeichnen: klicken für die erste Ecke, klicken für die gegenüberliegende Ecke">▭ Rechteck</button>
+        <button id="tool-poly3" class="tool" title="Dreieck zeichnen: klicken für Mittelpunkt, klicken für Radius/Ausrichtung">△ 3-Eck</button>
+        <button id="tool-poly5" class="tool" title="Fünfeck zeichnen: klicken für Mittelpunkt, klicken für Radius/Ausrichtung">⬠ 5-Eck</button>
+        <button id="tool-poly6" class="tool" title="Sechseck zeichnen: klicken für Mittelpunkt, klicken für Radius/Ausrichtung">⬡ 6-Eck</button>
+        <button id="tool-poly8" class="tool" title="Achteck zeichnen: klicken für Mittelpunkt, klicken für Radius/Ausrichtung">⏣ 8-Eck</button>
+        <button id="tool-text" class="tool" title="Text: rechts Schriftart/Größe/Breite einstellen, dann in die Skizze klicken (linker Rand der Grundlinie)">🔤 Text</button>
+        <button id="tool-holecircle" class="tool" title="Lochkreis: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken">◎ Lochkreis</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="main">
+    <div id="history-panel">
+      <div class="pane-title">Verlauf</div>
+      <div id="history-tree"></div>
+    </div>
+
+    <div id="sketch-pane" class="pane">
+      <div class="pane-title" id="sketch-pane-title">2D Skizze (Klicken zum Zeichnen)</div>
+      <canvas id="sketch-canvas"></canvas>
+      <div id="face-edit-controls" style="display:none">
+        <span id="face-edit-label">Formen auf dieser Fläche: „Aufaddieren“ = Erhebung, „Loch“ = Ausschnitt (echtes Boolean-Schneiden). Mit „⬆ Extrudieren“ übernehmen.</span>
+        <button id="btn-cancel-face-edit">✕ Abbrechen</button>
+      </div>
+      <div id="sketch-hint">Linien-Tool: Punkte anklicken, mit Doppelklick oder Enter schließen. Alt+Klick auf eine bestehende Linie: als Referenzlinie übernehmen (nächstes Segment richtet sich an deren Winkel aus). Strg gedrückt halten: aktuellen Winkel fixieren, Länge kann an anderen Linien einschnappen. Kreis-Tool: Klick = Mittelpunkt, dann ziehen und klicken = Radius. Rechteck-Tool: Klick = erste Ecke, Klick = gegenüberliegende Ecke. Vieleck-Tools (3/5/6/8-Eck): Klick = Mittelpunkt, dann ziehen und klicken = Radius und Ausrichtung. Text-Tool: rechts Einstellungen wählen, dann klicken = linker Rand der Grundlinie. Lochkreis-Tool: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken - wechselt danach automatisch ins Punkte-Tool zur Feinjustierung. Vor dem Extrudieren für jede Form im Formen-Optionsmenü „Loch“ oder „Aufaddieren“ sowie die eigene Höhe/Tiefe wählen. Auswahl-Tool: Strg+Klick fügt eine Form der Auswahl hinzu/entfernt sie, mehrere ausgewählte Formen lassen sich gemeinsam verschieben. Punkte-Tool: Eckpunkt oder Mittelpunkt anklicken, um die Koordinaten zu bearbeiten. Linien-Tool (⌒): Linie einer Linienform nahe einer Ecke anklicken, um dort einen Rundungsradius einzugeben (0 oder leer = scharfe Ecke). Mausrad: Zoom. Mittlere Maustaste ziehen: Ansicht verschieben.</div>
+    </div>
+
+    <div id="side-panel">
+      <div class="panel-block">
+        <h3>Formen</h3>
+        <div id="shape-list"></div>
+      </div>
+      <div class="panel-block" id="text-panel-block" style="display:none">
+        <h3>Text</h3>
+        <label>Text
+          <input type="text" id="text-content" value="Text" placeholder="Text eingeben">
+        </label>
+        <label>Schriftart
+          <select id="text-font"></select>
+        </label>
+        <label>Schriftgröße (mm)
+          <input type="number" id="text-size" value="15" min="0.5" step="0.5">
+        </label>
+        <label title="Breite/Ausdehnung der Buchstaben - 100% = normal, weniger = schmaler, mehr = breiter/gestreckt">Zeichenbreite (%)
+          <input type="number" id="text-scalex" value="100" min="10" step="5">
+        </label>
+        <label title="Zusätzlicher Abstand zwischen den Buchstaben, kann auch negativ sein">Zeichenabstand (mm)
+          <input type="number" id="text-spacing" value="0" step="0.1">
+        </label>
+        <div class="button-row">
+          <button type="button" id="text-mode-extrude" class="side-btn active">⬆ Extrudieren</button>
+          <button type="button" id="text-mode-cut" class="side-btn">⬇ Wegschneiden</button>
+        </div>
+        <label id="text-height-row"><span id="text-height-label">Höhe (mm)</span>
+          <input type="number" id="text-height" value="3" min="0.1" step="0.5">
+        </label>
+        <div class="button-row" id="text-side-row">
+          <button type="button" id="text-side-top" class="side-btn active">Oben</button>
+          <button type="button" id="text-side-bottom" class="side-btn">Unten</button>
+        </div>
+        <div id="text-font-status" style="font-size:11px; color:#aaa;"></div>
+      </div>
+      <div class="panel-block" id="holecircle-panel-block" style="display:none">
+        <h3>Lochkreis</h3>
+        <label title="Abstand vom Mittelpunkt zu jedem Loch">Radius (mm)
+          <input type="number" id="holecircle-radius" value="30" min="0.1" step="1">
+        </label>
+        <label>Anzahl Löcher
+          <input type="number" id="holecircle-count" value="6" min="1" step="1">
+        </label>
+        <label>Lochdurchmesser (mm)
+          <input type="number" id="holecircle-diameter" value="5" min="0.1" step="0.5">
+        </label>
+      </div>
+      <div class="panel-block" id="extrude-panel-block">
+        <h3>Extrusion</h3>
+        <div style="font-size:12px; color:#999; margin-bottom:8px;">Höhe/Tiefe wird pro Form in der Formen-Liste oben eingestellt (Aufaddieren/Loch).</div>
+        <button id="btn-extrude" class="primary">⬆ Extrudieren</button>
+        <div id="extrude-status"></div>
+      </div>
+      <div class="panel-block">
+        <h3>Flächenbearbeitung</h3>
+        <button id="btn-edit-face" disabled title="Erst extrudieren, dann eine Fläche des 3D-Modells anklicken, um dort weitere Formen hinzuzufügen oder auszuschneiden">🔲 Neue Skizze auf Fläche</button>
+      </div>
+      <div class="panel-block">
+        <h3>Export</h3>
+        <button id="btn-export" class="primary" disabled>⬇ Als .stl exportieren</button>
+      </div>
+    </div>
+
+    <div id="view-pane" class="pane">
+      <div class="pane-title">3D Vorschau</div>
+      <div id="viewer"></div>
+      <div id="face-select-hint" style="display:none">
+        <span>Klicke auf eine ebene Fläche des Modells (gekrümmte Flächen wie ein Kreis-Mantel werden pro Segment ausgewählt).</span>
+        <button id="btn-cancel-face-select">✕ Abbrechen</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script src="js/three.min.js"></script>
+<script src="js/OrbitControls.js"></script>
+<script src="js/STLExporter.js"></script>
+<script src="js/opentype.min.js"></script>
+<script src="js/embedded-fonts.js"></script>
+<script type="module" src="js/oc-init.js"></script>
+<script src="app.js" defer></script>
+</body>
+</html>
