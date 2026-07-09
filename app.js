@@ -11,10 +11,15 @@ let shapes = [];          // {id, type:'polygon'|'circle', points:[{x,y}]|null, 
                            // or isHole (cuts from Z=0 by its own holeDepth, same 'top'/'bottom' meaning via additiveSide) - see buildBaseGroup()
                            // text-tool pieces are plain `polygon` shapes too (kind:'text', char - see textToShapePieces)
                            // multi-piece placements (text, hole-circle patterns) share a `groupId` so they select/drag/edit together
-                           // polygon shapes may also have filletRadii: {vertexIndex: radiusMm} - rounded corners, see getFilletedPoints()
+                           // polygon shapes may also have filletRadii: {vertexIndex: radiusMm} - rounded corners - and/or
+                           // curveBulges: {edgeIndex: bulge} - bent edges (line tool, Shift-drag) - see getOutlinePoints()
 let nextShapeId = 1;
 let currentTool = 'line';
 let drawingPoints = [];   // in-progress polygon points
+let drawingBulges = {};   // in-progress polyline's curved edges: {edgeIndex: bulge} - see arcBulgePoints()
+let curveBulgeActive = false; // true while Shift is held during/after placing a point, bending the edge that just ended there
+let curveBulgeEdgeIndex = null; // drawingBulges key the mouse is currently adjusting, while curveBulgeActive
+let closePending = false; // true while bending the closing edge (Shift-click on the start point) - finishPolygon() runs on Shift-up instead of immediately
 let circleCenter = null;  // in-progress circle center
 let shapeStartPoint = null; // in-progress rect/regular-polygon tool: first click (corner or center)
 let mousePos = null;      // current mouse position (canvas space), for previews
@@ -25,6 +30,14 @@ let pointEditor = null;   // active point-mode X/Y <input> overlay, if any
 let filletEditor = null;  // active corner-radius <input> overlay, if any (see filletCornerArc)
 let history = [];         // stack of previous `shapes` snapshots, for undo
 let dragState = null;     // active shape-drag: {shapeId, original, startRaw, dx, dy, moved}
+let pointDragState = null; // active point-tool drag: {hit, startRaw, moved, orig} - see updatePointDrag()
+let backgroundImages = []; // reference images for the CURRENT sketch (base, or the active face feature) -
+                            // {id, dataUrl (base64, persisted), el (loaded HTMLImageElement, NOT persisted),
+                            //  x1,y1,x2,y2 (two diagonal world-space corners, order-independent)} - purely a
+                            // 2D drawing reference, does not participate in extrusion/history
+let nextBgImageId = 1;
+let selectedBgImageId = null; // single image selection, only shown/editable while currentTool === 'select'
+let bgImageDragState = null;  // active image move/resize: {id, corner:'x1y1'|'x2y1'|'x1y2'|'x2y2'|null (null = move), orig:{x1,y1,x2,y2}, startRaw}
 let viewScale = 1;        // world mm -> screen CSS px zoom factor
 let viewOffset = { x: 0, y: 0 }; // screen px position of world origin (0,0)
 let panState = null;      // active view pan (middle-mouse drag): {startX, startY, startOffset}
@@ -33,12 +46,13 @@ let refLineSeg = null;    // {a,b} endpoints of the reference line, for highligh
 let angleLockActive = false; // true while Ctrl is held during line drawing, fixing the current segment's angle
 let angleLockAngle = null;   // the fixed world-space angle (rad), captured at the moment Ctrl was pressed
 let angleLockSnapHit = null; // world point the locked-angle length last snapped onto (for a highlight dot), or null
+let angleLockAlignFrom = null; // world point the current snap hit is axis-aligned with (for a dashed guide line), or null
 
 // ---- face-editing state -----------------------------------------------------
 // faceFeatures: ordered list of applied face-sketch features (boss/pocket geometry
 // sketched on a picked planar face of the extruded solid), each:
 // {id, basis:{origin,normal,uAxis,vAxis} (THREE.Vector3, "centered model space"),
-//  boundaryLoopUV:[{x,y}], innerLoopsUV:[[{x,y}]], shapes:[...]}
+//  boundaryLoopUV:[{x,y}], innerLoopsUV:[[{x,y}]], shapes:[...], backgroundImages:[...]}
 let faceFeatures = [];
 let nextFeatureId = 1;
 let faceSelectMode = false;  // waiting for a click on the 3D model to pick a face
@@ -59,6 +73,15 @@ const LENGTH_SNAP_PX = 10;
 const HISTORY_LIMIT = 100;
 const MIN_SCALE = 0.2;
 const MAX_SCALE = 40;
+// Hard cap on a curved edge's bulge magnitude (see arcBulgePoints) - a huge bulge sweeps
+// its arc almost all the way around a full circle from one endpoint to the other, which
+// on most shapes ends up crossing the polygon's other edges and produces a self-
+// intersecting outline. OpenCascade doesn't reject that at draw time - it fails deep
+// inside the solid-building step instead (see rebuildSolid()'s try/catch), so this cap
+// just makes it harder to get there by accident via one wild mouse drag; it doesn't
+// guarantee a self-intersection-free shape (that depends on the whole polygon, not just
+// one edge's bulge).
+const MAX_BULGE = 8;
 
 // True whenever the in-memory project (shapes, extrude depth, face features)
 // differs from the last saved/loaded .mrcad file - drives the "unsaved
@@ -92,6 +115,8 @@ const btnClear = document.getElementById('btn-clear');
 const btnSaveProject = document.getElementById('btn-save-project');
 const btnLoadProject = document.getElementById('btn-load-project');
 const loadProjectInput = document.getElementById('load-project-input');
+const btnInsertBgImage = document.getElementById('btn-insert-bg-image');
+const bgImageInput = document.getElementById('bg-image-input');
 
 // BREP kernel (OpenCascade via replicad, see js/oc-init.js) loads
 // asynchronously - keep "Extrudieren" disabled with a status message until
@@ -515,6 +540,18 @@ function projectOntoRay(from, dir, point) {
   return perp <= SEGMENT_HIT_PX / viewScale ? proj : null;
 }
 
+// Returns the along-ray distance from `from` (in unit direction `dir`) at which the point
+// being placed lands level/plumb with `point` - i.e. shares its X (axis vertical) or Y
+// (axis horizontal) coordinate - regardless of how far `point` itself sits off the ray.
+// This is an alignment guide (like a design tool's "smart guide"), not a coincident-vertex
+// snap: it lets e.g. the closing corner of a triangle line up exactly with the start point
+// even though the start point isn't anywhere near the locked ray, so the angle-locked
+// segment can still be matched precisely without the grid snap rounding it off that mark.
+function alignmentLength(from, dir, point) {
+  const proj = (point.x - from.x) * dir.x + (point.y - from.y) * dir.y;
+  return proj > 0 ? proj : null;
+}
+
 // Returns the distance along the ray from `from` in direction `dir` (unit vector) at
 // which it crosses the finite segment a-b, or null if they don't cross in front of `from`.
 function raySegmentIntersection(from, dir, a, b) {
@@ -534,9 +571,13 @@ function raySegmentIntersection(from, dir, a, b) {
 // reference elsewhere on screen is ignored, rather than inflating the length the way the
 // raw cursor distance would. It also snaps onto vertices/edges of other shapes (and the
 // polyline being drawn) that lie along that fixed direction, so the new segment's endpoint
-// can be matched exactly to existing geometry. Falls back to a plain grid-snapped length
-// when nothing nearby lies on the ray. Also updates `angleLockSnapHit` for the caller to
-// draw a highlight at the snapped-to point.
+// can be matched exactly to existing geometry, and onto the length that would put the
+// endpoint level/plumb with any such vertex (see alignmentLength) even if that vertex is
+// nowhere near the ray itself - e.g. matching the closing corner of a triangle up with its
+// start point to get an exact right angle. Falls back to a plain grid-snapped length when
+// nothing nearby matches either way. Also updates `angleLockSnapHit`/`angleLockAlignFrom`
+// for the caller to draw a highlight at the snapped-to point (and a guide line back to the
+// vertex it aligned with, when applicable).
 function angleLockPoint(from, to, angle) {
   const dx = to.x - from.x;
   const dy = to.y - from.y;
@@ -549,26 +590,32 @@ function angleLockPoint(from, to, angle) {
   const catchDist = LENGTH_SNAP_PX / viewScale;
   let bestLength = null;
   let bestDiff = catchDist;
-  const consider = (length) => {
+  let bestAlignFrom = null;
+  const consider = (length, alignFrom) => {
     if (length === null) return;
     const d = Math.abs(length - rawLength);
-    if (d < bestDiff) { bestDiff = d; bestLength = length; }
+    if (d < bestDiff) { bestDiff = d; bestLength = length; bestAlignFrom = alignFrom || null; }
   };
 
   shapes.forEach(s => {
     if (s.type !== 'polygon') return;
-    s.points.forEach(p => consider(projectOntoRay(from, dir, p)));
+    s.points.forEach(p => {
+      consider(projectOntoRay(from, dir, p));
+      consider(alignmentLength(from, dir, p), p);
+    });
     for (let j = 0; j < s.points.length; j++) {
       consider(raySegmentIntersection(from, dir, s.points[j], s.points[(j + 1) % s.points.length]));
     }
   });
   for (let j = 0; j < drawingPoints.length - 1; j++) {
     consider(projectOntoRay(from, dir, drawingPoints[j]));
+    consider(alignmentLength(from, dir, drawingPoints[j]), drawingPoints[j]);
     consider(raySegmentIntersection(from, dir, drawingPoints[j], drawingPoints[j + 1]));
   }
 
   const length = bestLength !== null ? bestLength : snapLengthForAngle(rawLength, angle, getSnapSize());
   angleLockSnapHit = bestLength !== null ? { x: from.x + dir.x * length, y: from.y + dir.y * length } : null;
+  angleLockAlignFrom = bestAlignFrom;
   return { x: from.x + dir.x * length, y: from.y + dir.y * length };
 }
 
@@ -602,6 +649,8 @@ function render() {
   ctx.translate(viewOffset.x, viewOffset.y);
   ctx.scale(viewScale, viewScale);
 
+  drawBackgroundImages();
+
   drawGrid(w, h);
 
   // reference outline of the face being sketched on, if any (fixed, non-interactive)
@@ -613,6 +662,7 @@ function render() {
   if (currentTool === 'dimension') drawDimensionLabels();
   if (currentTool === 'point' || currentTool === 'origin') drawPointHandles();
   if (currentTool === 'edge') drawEdgeHandles();
+  if (currentTool === 'select') drawBackgroundImageHandles();
   drawDragLabel();
 
   // reference line selected via Alt-click, while drawing
@@ -636,13 +686,41 @@ function render() {
       ctx.strokeStyle = '#4a7dfc';
       ctx.beginPath();
       ctx.moveTo(drawingPoints[0].x, drawingPoints[0].y);
-      for (let i = 1; i < drawingPoints.length; i++) ctx.lineTo(drawingPoints[i].x, drawingPoints[i].y);
+      for (let i = 1; i < drawingPoints.length; i++) {
+        const bulge = drawingBulges[i - 1];
+        if (bulge) arcBulgePoints(drawingPoints[i - 1], drawingPoints[i], bulge).forEach(p => ctx.lineTo(p.x, p.y));
+        else ctx.lineTo(drawingPoints[i].x, drawingPoints[i].y);
+      }
       ctx.stroke();
+
+      // the edge currently being bent (Shift held) - highlighted, with a live radius label
+      if (curveBulgeActive && curveBulgeEdgeIndex !== null && drawingBulges[curveBulgeEdgeIndex]) {
+        const a = drawingPoints[curveBulgeEdgeIndex], b = bulgeEdgeEndpoint(curveBulgeEdgeIndex);
+        const bulge = drawingBulges[curveBulgeEdgeIndex];
+        const arcPts = arcBulgePoints(a, b, bulge);
+        ctx.strokeStyle = '#b48cff';
+        ctx.lineWidth = 3 / viewScale;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        arcPts.forEach(p => ctx.lineTo(p.x, p.y));
+        ctx.stroke();
+        ctx.lineWidth = 2 / viewScale;
+        const halfChord = dist(a, b) / 2;
+        const radius = halfChord * (1 + bulge * bulge) / (2 * Math.abs(bulge));
+        const apex = arcPts[Math.floor(arcPts.length / 2)] || a;
+        ctx.font = (11 / viewScale) + 'px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        drawLabelBg(apex.x, apex.y, 'R ' + radius.toFixed(1) + ' mm');
+      }
     }
     let previewPoint = null;
     const last = drawingPoints[drawingPoints.length - 1];
-    if (mousePos) {
+    // while bending the closing edge, there's no "next point" preview to show - the
+    // cursor is only steering that edge's bulge (rendered above), not a new vertex
+    if (mousePos && !closePending) {
       angleLockSnapHit = null;
+      angleLockAlignFrom = null;
       previewPoint = nextDrawPoint(mousePos);
       // the segment currently being dragged out is highlighted separately, so a locked
       // angle (Ctrl held) is visually distinguishable from freehand drawing
@@ -665,7 +743,23 @@ function render() {
       drawLabelBg(mid.x, mid.y, lenLabel);
 
       // highlight the point on another shape/segment the locked length snapped onto
-      if (angleLockActive && angleLockSnapHit) dot(angleLockSnapHit, '#37e6b3', 6);
+      if (angleLockActive && angleLockSnapHit) {
+        // when the snap came from an alignment guide (matching another vertex's X/Y
+        // rather than landing on the vertex itself), draw a dashed line to that vertex
+        // so it's clear what the endpoint just locked onto
+        if (angleLockAlignFrom) {
+          ctx.save();
+          ctx.strokeStyle = '#37e6b3';
+          ctx.lineWidth = 1 / viewScale;
+          ctx.setLineDash([4 / viewScale, 4 / viewScale]);
+          ctx.beginPath();
+          ctx.moveTo(angleLockAlignFrom.x, angleLockAlignFrom.y);
+          ctx.lineTo(angleLockSnapHit.x, angleLockSnapHit.y);
+          ctx.stroke();
+          ctx.restore();
+        }
+        dot(angleLockSnapHit, '#37e6b3', 6);
+      }
     }
   }
 
@@ -797,13 +891,41 @@ function drawGrid(w, h) {
   ctx.stroke();
 }
 
+// Draws every background reference image of the current sketch, in insertion
+// order, in world space - called before drawGrid() so images sit behind the
+// grid (and, since shapes are drawn after this, behind shapes too).
+function drawBackgroundImages() {
+  backgroundImages.forEach(bg => {
+    if (!bg.el) return; // not loaded yet (e.g. right after loadProject())
+    const x = Math.min(bg.x1, bg.x2), y = Math.min(bg.y1, bg.y2);
+    ctx.drawImage(bg.el, x, y, Math.abs(bg.x2 - bg.x1), Math.abs(bg.y2 - bg.y1));
+  });
+}
+
+const BG_HANDLE_HIT_PX = 10;
+
+// Draggable 4-corner bounding box for the currently selected background image,
+// only while the select tool is active - see hitTestBgImageHandle()/updateBgImageDrag().
+function drawBackgroundImageHandles() {
+  const bg = backgroundImages.find(b => b.id === selectedBgImageId);
+  if (!bg) return;
+  const x = Math.min(bg.x1, bg.x2), y = Math.min(bg.y1, bg.y2);
+  ctx.save();
+  ctx.strokeStyle = '#ffcc55';
+  ctx.lineWidth = 1.5 / viewScale;
+  ctx.setLineDash([5 / viewScale, 3 / viewScale]);
+  ctx.strokeRect(x, y, Math.abs(bg.x2 - bg.x1), Math.abs(bg.y2 - bg.y1));
+  ctx.restore();
+  [[bg.x1, bg.y1], [bg.x2, bg.y1], [bg.x1, bg.y2], [bg.x2, bg.y2]].forEach(([hx, hy]) => dot({ x: hx, y: hy }, '#ffcc55', 6));
+}
+
 function drawShape(shape, selected) {
   const color = shape.isHole ? '#cc8b2c' : shape.isAdditive ? '#4a9eff' : (selected ? '#ffcc55' : '#5fd06b');
   ctx.strokeStyle = color;
   ctx.lineWidth = (selected ? 3 : 2) / viewScale;
   ctx.beginPath();
   if (shape.type === 'polygon') {
-    const pts = getFilletedPoints(shape);
+    const pts = getOutlinePoints(shape);
     ctx.moveTo(pts[0].x, pts[0].y);
     for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
     ctx.closePath();
@@ -845,7 +967,14 @@ function drawDimensionLabels() {
       for (let j = 0; j < s.points.length; j++) {
         const a = s.points[j];
         const b = s.points[(j + 1) % s.points.length];
-        drawLabelBg((a.x + b.x) / 2, (a.y + b.y) / 2, dist(a, b).toFixed(1) + ' mm');
+        const bulge = s.curveBulges && s.curveBulges[j];
+        if (bulge) {
+          const arcPts = arcBulgePoints(a, b, bulge);
+          const apex = arcPts[Math.floor(arcPts.length / 2)] || a;
+          drawLabelBg(apex.x, apex.y, 'R ' + radiusForBulge(dist(a, b), bulge).toFixed(1) + ' mm');
+        } else {
+          drawLabelBg((a.x + b.x) / 2, (a.y + b.y) / 2, dist(a, b).toFixed(1) + ' mm');
+        }
       }
     } else {
       drawLabelBg(s.center.x, s.center.y - s.radius - 12 / viewScale, 'R' + s.radius.toFixed(1) + ' mm');
@@ -935,6 +1064,48 @@ function drawDragLabel() {
 // Sketch interaction
 // ===========================================================================
 
+// Per-tool keyboard/mouse shortcut cheat-sheet, shown in the side panel above "Formen" -
+// see updateToolShortcuts(). Each entry is [key label, what it does].
+const TOOL_SHORTCUTS = {
+  line: [
+    ['Klick', 'Punkt setzen (gerades Segment)'],
+    ['Shift + Klick', 'Punkt setzen und Segment zu einem Bogen biegen - Stärke folgt der Maus'],
+    ['Strg (halten)', 'Achse einfrieren - Länge rastet an anderen Linien/Punkten ein'],
+    ['Alt + Klick', 'Linie als Referenzwinkel für das nächste Segment übernehmen'],
+    ['Doppelklick / Enter', 'Form schließen'],
+  ],
+  circle: [
+    ['Klick', 'Mittelpunkt setzen'],
+    ['Ziehen + Klick', 'Radius festlegen'],
+  ],
+  rect: [
+    ['Klick', 'Erste Ecke setzen'],
+    ['Klick', 'Gegenüberliegende Ecke setzen'],
+  ],
+  poly3: [['Klick', 'Mittelpunkt setzen'], ['Ziehen + Klick', 'Radius und Ausrichtung festlegen']],
+  poly5: [['Klick', 'Mittelpunkt setzen'], ['Ziehen + Klick', 'Radius und Ausrichtung festlegen']],
+  poly6: [['Klick', 'Mittelpunkt setzen'], ['Ziehen + Klick', 'Radius und Ausrichtung festlegen']],
+  poly8: [['Klick', 'Mittelpunkt setzen'], ['Ziehen + Klick', 'Radius und Ausrichtung festlegen']],
+  text: [['Rechts', 'Schriftart/Größe/Höhe einstellen'], ['Klick', 'Linker Rand der Grundlinie']],
+  holecircle: [['Rechts', 'Radius/Anzahl/Durchmesser einstellen'], ['Klick', 'Mittelpunkt setzen (wechselt danach ins Punkte-Tool)']],
+  select: [['Klick', 'Form auswählen/verschieben'], ['Strg + Klick', 'Weitere Form zur Auswahl hinzufügen/entfernen']],
+  dimension: [['Klick', 'Linie, Kreis oder gebogene Linie anklicken, Länge/Radius eingeben']],
+  origin: [['Klick', 'Eckpunkt oder Mittelpunkt als neuen Ursprung setzen']],
+  point: [
+    ['Klick', 'Eckpunkt oder Mittelpunkt anklicken, Koordinaten bearbeiten'],
+    ['Klick + Ziehen', 'Punkt an neue Position schieben (rastet auf dem Snap-Raster ein)'],
+  ],
+  edge: [['Klick nahe Ecke', 'Rundungsradius eingeben (0/leer = scharfe Ecke)']],
+};
+
+function updateToolShortcuts() {
+  const list = document.getElementById('shortcuts-list');
+  const items = TOOL_SHORTCUTS[currentTool] || [];
+  list.innerHTML = items.map(([key, desc]) =>
+    `<div class="shortcut-row"><span class="shortcut-key">${key}</span><span class="shortcut-desc">${desc}</span></div>`
+  ).join('');
+}
+
 function setTool(tool) {
   currentTool = tool;
   cancelInProgress();
@@ -942,16 +1113,22 @@ function setTool(tool) {
   closePointEditor(true);
   closeFilletEditor(true);
   endDrag();
+  endBgImageDrag();
   document.querySelectorAll('.tool').forEach(b => b.classList.remove('active'));
   document.getElementById('tool-' + tool).classList.add('active');
   document.getElementById('text-panel-block').style.display = (tool === 'text') ? 'block' : 'none';
   document.getElementById('holecircle-panel-block').style.display = (tool === 'holecircle') ? 'block' : 'none';
   canvas.style.cursor = (tool === 'select' || tool === 'dimension' || tool === 'point' || tool === 'edge' || tool === 'origin') ? 'pointer' : 'crosshair';
+  updateToolShortcuts();
   render();
 }
 
 function cancelInProgress() {
   drawingPoints = [];
+  drawingBulges = {};
+  curveBulgeActive = false;
+  curveBulgeEdgeIndex = null;
+  closePending = false;
   circleCenter = null;
   shapeStartPoint = null;
   refLineAngle = null;
@@ -959,21 +1136,49 @@ function cancelInProgress() {
   angleLockActive = false;
   angleLockAngle = null;
   angleLockSnapHit = null;
+  angleLockAlignFrom = null;
 }
 
 function finishPolygon() {
   if (drawingPoints.length >= 3) {
     pushHistory();
-    shapes.push({ id: nextShapeId++, type: 'polygon', points: drawingPoints.slice(), isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: 'top', holeDepth: 5 });
+    const shape = { id: nextShapeId++, type: 'polygon', points: drawingPoints.slice(), isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: 'top', holeDepth: 5 };
+    if (Object.keys(drawingBulges).length > 0) shape.curveBulges = { ...drawingBulges };
+    shapes.push(shape);
     onShapesChanged();
   }
   drawingPoints = [];
+  drawingBulges = {};
+  curveBulgeActive = false;
+  curveBulgeEdgeIndex = null;
+  closePending = false;
   refLineAngle = null;
   refLineSeg = null;
   angleLockActive = false;
   angleLockAngle = null;
   angleLockSnapHit = null;
+  angleLockAlignFrom = null;
   render();
+}
+
+// Finalizes whatever edge is currently being bent (Shift-drag) - shared by releasing
+// Shift and by clicking while still bending. A click always ends the bend rather than
+// also placing a new point at wherever it landed - that used to be a common mis-click
+// (still holding Shift, clicking to "confirm" the curve) that silently added a surprise
+// extra segment instead.
+function commitCurveBulge() {
+  if (!curveBulgeActive) return;
+  if (curveBulgeEdgeIndex !== null && Math.abs(drawingBulges[curveBulgeEdgeIndex] || 0) < 0.02) {
+    delete drawingBulges[curveBulgeEdgeIndex];
+  }
+  curveBulgeActive = false;
+  curveBulgeEdgeIndex = null;
+  if (closePending) {
+    closePending = false;
+    finishPolygon();
+  } else {
+    render();
+  }
 }
 
 function markDirty() {
@@ -997,6 +1202,13 @@ function onShapesChanged() {
 canvas.addEventListener('mousemove', (evt) => {
   mousePos = getMousePos(evt);
   if (dragState) updateDrag(mousePos);
+  if (bgImageDragState) updateBgImageDrag(mousePos);
+  if (pointDragState) updatePointDrag(mousePos);
+  if (curveBulgeActive && curveBulgeEdgeIndex !== null) {
+    const a = drawingPoints[curveBulgeEdgeIndex], b = bulgeEdgeEndpoint(curveBulgeEdgeIndex);
+    const bulge = bulgeFromMouse(a, b, mousePos);
+    drawingBulges[curveBulgeEdgeIndex] = Math.max(-MAX_BULGE, Math.min(MAX_BULGE, bulge));
+  }
   render();
 });
 
@@ -1068,6 +1280,20 @@ document.getElementById('btn-reset-view').addEventListener('click', () => {
 canvas.addEventListener('mousedown', (evt) => {
   if (currentTool !== 'select' || evt.button !== 0) return;
   const raw = getMousePos(evt);
+
+  if (!evt.ctrlKey && !evt.metaKey) {
+    // Dragging a handle of the currently selected background image takes
+    // priority over shape hit-testing, so handles stay grabbable even where
+    // they overlap a shape underneath.
+    const handleHit = hitTestBgImageHandle(raw);
+    if (handleHit) {
+      bgImageDragState = { id: handleHit.bg.id, corner: handleHit.corner, orig: { ...handleHit.bg }, startRaw: raw };
+      canvas.style.cursor = 'grabbing';
+      render();
+      return;
+    }
+  }
+
   const hit = hitTestShape(raw);
 
   if (evt.ctrlKey || evt.metaKey) {
@@ -1083,11 +1309,25 @@ canvas.addEventListener('mousedown', (evt) => {
   }
 
   if (!hit) {
+    // Shapes take priority over background images (they're drawn on top), so
+    // only fall back to picking an image when no shape was hit.
+    const imgHit = hitTestBgImage(raw);
+    if (imgHit) {
+      selectedShapeIds.clear();
+      renderShapeList();
+      selectedBgImageId = imgHit.id;
+      bgImageDragState = { id: imgHit.id, corner: null, orig: { x1: imgHit.x1, y1: imgHit.y1, x2: imgHit.x2, y2: imgHit.y2 }, startRaw: raw };
+      render();
+      return;
+    }
     selectedShapeIds.clear();
+    selectedBgImageId = null;
     renderShapeList();
     render();
     return;
   }
+
+  selectedBgImageId = null;
 
   // Clicking a shape that's already part of the current multi-selection keeps
   // the whole selection (so it can be dragged together); clicking anything
@@ -1146,7 +1386,109 @@ function endDrag() {
   render();
 }
 
-window.addEventListener('mouseup', () => { endDrag(); endPan(); });
+// Point-tool: mousedown on a vertex/center/group-center starts a potential drag rather
+// than opening the coordinate editor immediately - endPointDrag() (on mouseup) decides
+// which one actually happened, based on whether the mouse moved enough to snap to a
+// different grid position in between. A plain click (no movement) still opens the editor,
+// same as before.
+canvas.addEventListener('mousedown', (evt) => {
+  if (currentTool !== 'point' || evt.button !== 0) return;
+  closePointEditor(true); // applies+closes any editor left open from a previous point first,
+  const raw = getMousePos(evt);      // so hit-testing below sees up-to-date coordinates
+  const hit = hitTestPoint(raw);
+  if (!hit) return;
+  pointDragState = { hit, startRaw: raw, moved: false, orig: null };
+  canvas.style.cursor = 'grabbing';
+});
+
+// Captures the original coordinates a point-tool drag will translate by delta, in the
+// same shape/kind-specific way applyPoint() interprets a hit (see there) - a plain {x,y}
+// for a single vertex or circle center, the full points array for a polygon's centroid,
+// or every group member's points/center for a group-center drag.
+function snapshotPointTarget(hit) {
+  if (hit.kind === 'vertex') return { x: hit.shape.points[hit.index].x, y: hit.shape.points[hit.index].y };
+  if (hit.kind === 'groupcenter') {
+    return {
+      members: shapes.filter(sh => sh.groupId === hit.groupId).map(sh => (
+        sh.type === 'circle' ? { center: { ...sh.center } } : { points: sh.points.map(p => ({ ...p })) }
+      )),
+    };
+  }
+  if (hit.shape.type === 'circle') return { x: hit.shape.center.x, y: hit.shape.center.y };
+  return { points: hit.shape.points.map(p => ({ ...p })) };
+}
+
+function updatePointDrag(raw) {
+  const g = getSnapSize();
+  const dx = snapValue(raw.x - pointDragState.startRaw.x, g);
+  const dy = snapValue(raw.y - pointDragState.startRaw.y, g);
+  if (dx === 0 && dy === 0) return;
+  if (!pointDragState.moved) {
+    pushHistory(); // snapshot taken once, right before the point actually starts moving
+    pointDragState.moved = true;
+    pointDragState.orig = snapshotPointTarget(pointDragState.hit);
+  }
+  const { hit, orig } = pointDragState;
+  if (hit.kind === 'vertex') {
+    hit.shape.points[hit.index] = { x: orig.x + dx, y: orig.y + dy };
+  } else if (hit.kind === 'groupcenter') {
+    shapes.filter(sh => sh.groupId === hit.groupId).forEach((sh, idx) => {
+      const o = orig.members[idx];
+      if (sh.type === 'circle') sh.center = { x: o.center.x + dx, y: o.center.y + dy };
+      else sh.points = o.points.map(p => ({ x: p.x + dx, y: p.y + dy }));
+    });
+  } else if (hit.shape.type === 'circle') {
+    hit.shape.center = { x: orig.x + dx, y: orig.y + dy };
+  } else {
+    hit.shape.points = orig.points.map(p => ({ x: p.x + dx, y: p.y + dy }));
+  }
+  markDirty();
+  render();
+}
+
+function endPointDrag() {
+  if (!pointDragState) return;
+  const { hit, moved } = pointDragState;
+  pointDragState = null;
+  canvas.style.cursor = 'pointer';
+  if (moved) {
+    onShapesChanged();
+    render();
+  } else {
+    openPointEditor(hit);
+  }
+}
+
+// Moving/resizing a background image doesn't touch `shapes`, so unlike
+// updateDrag() this never calls markDirty()/pushHistory() - the image is a
+// pure 2D drawing reference and doesn't participate in extrusion or undo.
+function updateBgImageDrag(raw) {
+  const bg = backgroundImages.find(b => b.id === bgImageDragState.id);
+  if (!bg) return;
+  const st = bgImageDragState;
+  if (st.corner) {
+    const p = snap(raw);
+    if (st.corner === 'x1y1') { bg.x1 = p.x; bg.y1 = p.y; }
+    else if (st.corner === 'x2y1') { bg.x2 = p.x; bg.y1 = p.y; }
+    else if (st.corner === 'x1y2') { bg.x1 = p.x; bg.y2 = p.y; }
+    else if (st.corner === 'x2y2') { bg.x2 = p.x; bg.y2 = p.y; }
+  } else {
+    const g = getSnapSize();
+    const dx = snapValue(raw.x - st.startRaw.x, g), dy = snapValue(raw.y - st.startRaw.y, g);
+    bg.x1 = st.orig.x1 + dx; bg.y1 = st.orig.y1 + dy;
+    bg.x2 = st.orig.x2 + dx; bg.y2 = st.orig.y2 + dy;
+  }
+  markProjectDirty();
+}
+
+function endBgImageDrag() {
+  if (!bgImageDragState) return;
+  bgImageDragState = null;
+  canvas.style.cursor = 'pointer';
+  render();
+}
+
+window.addEventListener('mouseup', () => { endDrag(); endBgImageDrag(); endPan(); endPointDrag(); });
 
 canvas.addEventListener('click', (evt) => {
   const raw = getMousePos(evt);
@@ -1174,8 +1516,25 @@ canvas.addEventListener('click', (evt) => {
   }
 
   if (currentTool === 'line') {
+    if (curveBulgeActive) {
+      // a click while still bending an edge ends the bend (same as releasing Shift)
+      // instead of also placing a new point wherever the click happened to land
+      commitCurveBulge();
+      return;
+    }
     if (drawingPoints.length >= 3 && dist(raw, drawingPoints[0]) <= CLOSE_SNAP_PX / viewScale) {
-      finishPolygon();
+      if (evt.shiftKey) {
+        // bend the closing edge (last point -> start point) instead of closing right away -
+        // finishPolygon() only runs once Shift is released (see the keyup handler)
+        curveBulgeEdgeIndex = drawingPoints.length - 1;
+        curveBulgeActive = true;
+        closePending = true;
+        const a = drawingPoints[curveBulgeEdgeIndex], b = drawingPoints[0];
+        drawingBulges[curveBulgeEdgeIndex] = Math.max(-MAX_BULGE, Math.min(MAX_BULGE, bulgeFromMouse(a, b, mousePos || raw)));
+        render();
+      } else {
+        finishPolygon();
+      }
       return;
     }
     drawingPoints.push(nextDrawPoint(raw));
@@ -1184,6 +1543,18 @@ canvas.addEventListener('click', (evt) => {
     if (refLineAngle !== null) {
       refLineAngle = null;
       refLineSeg = null;
+    }
+    // Shift held while placing this point: bend the edge that just ended here, following
+    // the mouse - lets straight and curved segments mix freely in the same contour.
+    // Placing a point without Shift held keeps/locks it straight; the bend can only be
+    // adjusted live while placing that same point, not revisited afterward.
+    if (evt.shiftKey && drawingPoints.length >= 2) {
+      curveBulgeEdgeIndex = drawingPoints.length - 2;
+      curveBulgeActive = true;
+      drawingBulges[curveBulgeEdgeIndex] = Math.max(-MAX_BULGE, Math.min(MAX_BULGE, bulgeFromMouse(drawingPoints[curveBulgeEdgeIndex], drawingPoints[curveBulgeEdgeIndex + 1], mousePos || raw)));
+    } else {
+      curveBulgeActive = false;
+      curveBulgeEdgeIndex = null;
     }
     render();
   } else if (currentTool === 'circle') {
@@ -1266,10 +1637,6 @@ canvas.addEventListener('click', (evt) => {
   } else if (currentTool === 'dimension') {
     const hit = hitTestSegment(raw);
     if (hit) openLengthEditor(hit);
-  } else if (currentTool === 'point') {
-    const hit = hitTestPoint(raw);
-    if (hit) openPointEditor(hit);
-    else closePointEditor(true);
   } else if (currentTool === 'origin') {
     const hit = hitTestPoint(raw);
     if (hit) {
@@ -1305,6 +1672,12 @@ document.addEventListener('keydown', (evt) => {
     evt.preventDefault();
     deleteShapes(Array.from(selectedShapeIds));
   }
+  if ((evt.key === 'Delete' || evt.key === 'Backspace') && selectedShapeIds.size === 0 && selectedBgImageId != null) {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return; // don't hijack text editing
+    evt.preventDefault();
+    deleteBgImage(selectedBgImageId);
+  }
   // Ctrl held while drawing a line: lock the segment's current angle so only its length
   // still follows the mouse, snapping onto other lines to determine that length.
   if (evt.key === 'Control' && currentTool === 'line' && drawingPoints.length > 0 && !angleLockActive && mousePos) {
@@ -1321,8 +1694,10 @@ document.addEventListener('keyup', (evt) => {
     angleLockActive = false;
     angleLockAngle = null;
     angleLockSnapHit = null;
+    angleLockAlignFrom = null;
     render();
   }
+  if (evt.key === 'Shift' && curveBulgeActive) commitCurveBulge();
 });
 
 function deleteShape(id) {
@@ -1336,6 +1711,16 @@ function deleteShapes(ids) {
   shapes = shapes.filter(sh => !idSet.has(sh.id));
   idSet.forEach(id => selectedShapeIds.delete(id));
   onShapesChanged();
+  render();
+}
+
+// Background images don't participate in extrusion/history (see backgroundImages
+// declaration), so unlike deleteShapes() this doesn't call pushHistory()/markDirty().
+function deleteBgImage(id) {
+  backgroundImages = backgroundImages.filter(bg => bg.id !== id);
+  if (selectedBgImageId === id) selectedBgImageId = null;
+  endBgImageDrag();
+  markProjectDirty();
   render();
 }
 
@@ -1363,6 +1748,24 @@ function hitTestShape(pt) {
   return null;
 }
 
+function hitTestBgImage(pt) {
+  for (let i = backgroundImages.length - 1; i >= 0; i--) {
+    const bg = backgroundImages[i];
+    const x = Math.min(bg.x1, bg.x2), y = Math.min(bg.y1, bg.y2);
+    if (pt.x >= x && pt.x <= x + Math.abs(bg.x2 - bg.x1) && pt.y >= y && pt.y <= y + Math.abs(bg.y2 - bg.y1)) return bg;
+  }
+  return null;
+}
+
+function hitTestBgImageHandle(pt) {
+  const bg = backgroundImages.find(b => b.id === selectedBgImageId);
+  if (!bg) return null;
+  const threshold = BG_HANDLE_HIT_PX / viewScale;
+  const corners = [['x1y1', bg.x1, bg.y1], ['x2y1', bg.x2, bg.y1], ['x1y2', bg.x1, bg.y2], ['x2y2', bg.x2, bg.y2]];
+  for (const [corner, cx, cy] of corners) if (dist(pt, { x: cx, y: cy }) <= threshold) return { bg, corner };
+  return null;
+}
+
 function distToSegment(p, a, b) {
   const l2 = (b.x - a.x) ** 2 + (b.y - a.y) ** 2;
   if (l2 === 0) return dist(p, a);
@@ -1375,7 +1778,7 @@ function distToSegment(p, a, b) {
 // Corner rounding ("Rundung"): a shape's raw `points` stay the sharp-corner
 // source of truth (so dragging/point-editing/hit-testing keep working
 // unchanged) - `filletRadii` is a sparse {vertexIndex: radiusMm} map, and
-// getFilletedPoints() derives the actual rendered/extruded outline (sharp
+// getOutlinePoints() derives the actual rendered/extruded outline (sharp
 // corners replaced by tangent arcs) on demand. Only 2D rendering and 3D
 // extrusion read the derived outline; everything else keeps using the plain
 // vertex list.
@@ -1435,25 +1838,124 @@ function filletCornerArc(prev, curr, next, radius) {
   return pts;
 }
 
-// The outline actually used for 2D rendering and 3D extrusion: sharp corners
-// listed in `shape.filletRadii` replaced by their tangent arc. Falls back to
-// the plain `shape.points` untouched when there's nothing to round (the
-// overwhelmingly common case), so this is cheap to call on every render.
-function getFilletedPoints(shape) {
-  if (shape.type !== 'polygon' || !shape.filletRadii) return shape.points;
-  const keys = Object.keys(shape.filletRadii);
-  if (keys.length === 0) return shape.points;
+// Tessellates a circular-arc replacement for the straight edge a->b, using the
+// DXF-style "bulge" convention: bulge = tan(includedAngle/4), which conveniently
+// equals sagitta/halfChord (the arc's peak offset from the chord, as a fraction of
+// half the chord length) - so the same bulge value keeps its shape if a/b are later
+// moved (e.g. via the point tool), rather than needing to be re-tuned. Sign of the
+// bulge picks which side of a->b the arc bows toward (see bulgeFromMouse). Returns
+// the points from just after `a` through (and including) `b` - callers push `a`
+// itself, same convention as filletCornerArc's midpoints.
+function arcBulgePoints(a, b, bulge) {
+  if (!bulge) return [];
+  const chordLen = dist(a, b);
+  if (chordLen < 1e-6) return [];
+  const theta = 4 * Math.atan(bulge); // signed included angle, a -> b
+  const radius = chordLen / (2 * Math.sin(theta / 2)); // signed - see angleToCenter below
+  const gamma = (Math.PI - theta) / 2; // isosceles triangle a/center/b: base angle at `a`
+  const chordAngle = Math.atan2(b.y - a.y, b.x - a.x);
+  const angleToCenter = chordAngle + gamma;
+  // `radius` carries the sign that makes this land the center on the correct side for
+  // the arc to bow the way `bulge`'s sign intends - stepping by `theta` from `a` then
+  // reaches `b` exactly, however large or small the bulge is (unlike deriving the center
+  // from a separate "which side" sign, which can disagree with which way `theta` sweeps).
+  const center = { x: a.x + radius * Math.cos(angleToCenter), y: a.y + radius * Math.sin(angleToCenter) };
+  const absRadius = Math.abs(radius);
+  const startAngle = Math.atan2(a.y - center.y, a.x - center.x);
+  const steps = Math.max(2, Math.round((Math.abs(theta) / (Math.PI / 2)) * 8));
+  const pts = [];
+  for (let i = 1; i <= steps; i++) {
+    const ang = startAngle + theta * (i / steps);
+    pts.push({ x: center.x + absRadius * Math.cos(ang), y: center.y + absRadius * Math.sin(ang) });
+  }
+  return pts;
+}
+
+// Derives the bulge value (see arcBulgePoints) that a live mouse position implies for
+// the edge a->b, while the user drags to bend it: proportional to how far off the
+// a->b line the mouse sits, signed by which side it's on. Not clamped - callers cap it.
+function bulgeFromMouse(a, b, mouse) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const chordLen = Math.hypot(dx, dy);
+  if (chordLen < 1e-6) return 0;
+  const ux = dx / chordLen, uy = dy / chordLen;
+  const perp = (mouse.x - a.x) * uy + (mouse.y - a.y) * -ux;
+  return perp / (chordLen / 2);
+}
+
+// The other endpoint of drawingPoints[index]'s edge while it's being bent - the next
+// vertex, except for the closing edge (index === length-1), which wraps back to the
+// start point instead, since that edge isn't a real drawingPoints entry.
+function bulgeEdgeEndpoint(index) {
+  return index === drawingPoints.length - 1 ? drawingPoints[0] : drawingPoints[index + 1];
+}
+
+// The radius of the circle a bulge value traces for a given chord length - the inverse
+// of the sagitta/halfChord relationship described at arcBulgePoints.
+function radiusForBulge(chordLen, bulge) {
+  const halfChord = chordLen / 2;
+  const b = Math.abs(bulge);
+  return halfChord * (1 + b * b) / (2 * b);
+}
+
+// Solves the above the other way round: what bulge gives a chord of `chordLen` an arc of
+// exactly `radius`? A radius has two matching bulge magnitudes for any given chord (a
+// "minor" and a "major" arc through the same two points, reciprocal of each other) - this
+// picks whichever is closer to `currentBulge`'s magnitude, so nudging the radius via the
+// dimension editor doesn't suddenly flip a gentle curve into a near-full loop or back.
+// The chord's two endpoints are left untouched; only how far the arc bows changes.
+function bulgeForRadius(chordLen, radius, currentBulge) {
+  const halfChord = chordLen / 2;
+  const r = Math.max(radius, halfChord); // halfChord is the tightest possible arc (a semicircle)
+  const root = Math.sqrt(Math.max(0, r * r - halfChord * halfChord));
+  const b1 = (r - root) / halfChord;
+  const b2 = (r + root) / halfChord;
+  const curAbs = Math.abs(currentBulge) || 1;
+  const chosen = Math.min(MAX_BULGE, Math.abs(b1 - curAbs) <= Math.abs(b2 - curAbs) ? b1 : b2);
+  return chosen * Math.sign(currentBulge || 1);
+}
+
+// The outline actually used for 2D rendering and 3D extrusion: sharp corners listed
+// in `shape.filletRadii` replaced by their tangent arc, and edges listed in
+// `shape.curveBulges` replaced by their bulge arc (see arcBulgePoints - set by the
+// line tool's Shift-drag). Falls back to the plain `shape.points` untouched when
+// there's nothing to round/bend (the overwhelmingly common case), so this is cheap
+// to call on every render.
+function getOutlinePoints(shape) {
+  if (shape.type !== 'polygon') return shape.points;
+  const hasFillet = shape.filletRadii && Object.keys(shape.filletRadii).length > 0;
+  const hasBulge = shape.curveBulges && Object.keys(shape.curveBulges).length > 0;
+  if (!hasFillet && !hasBulge) return shape.points;
   const pts = shape.points;
   const n = pts.length;
   const result = [];
   for (let i = 0; i < n; i++) {
-    const r = shape.filletRadii[i];
-    if (!r || r <= 0) { result.push(pts[i]); continue; }
-    const prev = pts[(i - 1 + n) % n];
-    const next = pts[(i + 1) % n];
-    filletCornerArc(prev, pts[i], next, r).forEach(p => result.push(p));
+    const r = hasFillet ? shape.filletRadii[i] : null;
+    if (r && r > 0) {
+      const prev = pts[(i - 1 + n) % n];
+      const next = pts[(i + 1) % n];
+      filletCornerArc(prev, pts[i], next, r).forEach(p => result.push(p));
+    } else {
+      result.push(pts[i]);
+    }
+    const bulge = hasBulge ? shape.curveBulges[i] : null;
+    if (bulge) {
+      const next = pts[(i + 1) % n];
+      arcBulgePoints(pts[i], next, bulge).forEach(p => result.push(p));
+    }
   }
   return result;
+}
+
+// Distance from `pt` to the bent edge a->b (bulge per arcBulgePoints), and the point on
+// that arc closest to its middle (a good spot for a length/radius label or hit midpoint) -
+// measured against the actual tessellated arc, not the straight chord, so a hit/label
+// lands where the curve is actually drawn even for a pronounced bulge.
+function distAndApexOnArc(pt, a, b, bulge) {
+  const arcPts = [a, ...arcBulgePoints(a, b, bulge)];
+  let best = Infinity;
+  for (let k = 0; k < arcPts.length - 1; k++) best = Math.min(best, distToSegment(pt, arcPts[k], arcPts[k + 1]));
+  return { dist: best, apex: arcPts[Math.floor(arcPts.length / 2)] || a };
 }
 
 function hitTestSegment(pt) {
@@ -1464,8 +1966,12 @@ function hitTestSegment(pt) {
       for (let j = 0; j < s.points.length; j++) {
         const a = s.points[j];
         const b = s.points[(j + 1) % s.points.length];
-        if (distToSegment(pt, a, b) <= threshold) {
-          return { shape: s, segIndex: j, midpoint: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } };
+        const bulge = s.curveBulges && s.curveBulges[j];
+        if (bulge) {
+          const { dist: d, apex } = distAndApexOnArc(pt, a, b, bulge);
+          if (d <= threshold) return { shape: s, segIndex: j, midpoint: apex, isCurve: true };
+        } else if (distToSegment(pt, a, b) <= threshold) {
+          return { shape: s, segIndex: j, midpoint: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, isCurve: false };
         }
       }
     } else if (s.type === 'circle') {
@@ -1567,12 +2073,21 @@ function closeLengthEditor(apply) {
 }
 
 // anchor 'a' keeps the segment's start point (points[segIndex]) fixed and moves the end point;
-// anchor 'b' keeps the end point fixed and moves the start point instead.
+// anchor 'b' keeps the end point fixed and moves the start point instead. Not used for a
+// curved edge (isCurve) - there `newLength` is a radius and both endpoints stay put, only
+// the bulge changes - see bulgeForRadius().
 function applyLength(hit, newLength, anchor) {
   const s = hit.shape;
   if (s.type === 'circle') {
     pushHistory();
     s.radius = newLength;
+    onShapesChanged();
+    return;
+  }
+  if (hit.isCurve) {
+    const a = s.points[hit.segIndex], b = s.points[(hit.segIndex + 1) % s.points.length];
+    pushHistory();
+    s.curveBulges[hit.segIndex] = bulgeForRadius(dist(a, b), newLength, s.curveBulges[hit.segIndex]);
     onShapesChanged();
     return;
   }
@@ -1596,7 +2111,15 @@ function openLengthEditor(hit) {
   closeLengthEditor(true);
   const s = hit.shape;
   const isLine = hit.segIndex !== null;
-  const currentLength = isLine ? dist(s.points[hit.segIndex], s.points[(hit.segIndex + 1) % s.points.length]) : s.radius;
+  let currentLength;
+  if (hit.isCurve) {
+    const a = s.points[hit.segIndex], b = s.points[(hit.segIndex + 1) % s.points.length];
+    currentLength = radiusForBulge(dist(a, b), s.curveBulges[hit.segIndex]);
+  } else if (isLine) {
+    currentLength = dist(s.points[hit.segIndex], s.points[(hit.segIndex + 1) % s.points.length]);
+  } else {
+    currentLength = s.radius;
+  }
 
   const screenPos = worldToScreen(hit.midpoint.x, hit.midpoint.y);
   const wrap = document.createElement('div');
@@ -1617,7 +2140,7 @@ function openLengthEditor(hit) {
   });
   input.addEventListener('blur', () => closeLengthEditor(true));
 
-  if (isLine) {
+  if (isLine && !hit.isCurve) {
     const btnA = document.createElement('button');
     btnA.type = 'button';
     btnA.className = 'dim-anchor-btn active';
@@ -2116,6 +2639,44 @@ document.getElementById('tool-origin').addEventListener('click', () => setTool('
 document.getElementById('tool-point').addEventListener('click', () => setTool('point'));
 document.getElementById('tool-edge').addEventListener('click', () => setTool('edge'));
 
+updateToolShortcuts(); // reflect the initial tool ('line') before any button is clicked
+
+btnInsertBgImage.addEventListener('click', () => {
+  bgImageInput.value = '';
+  bgImageInput.click();
+});
+
+bgImageInput.addEventListener('change', () => {
+  const file = bgImageInput.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => insertBackgroundImage(reader.result);
+  reader.readAsDataURL(file);
+});
+
+// Drops a newly picked image into the sketch, centered in the current view and
+// sized to fit comfortably within it (aspect ratio preserved) - then switches to
+// the select tool with the new image selected so it's immediately movable/resizable.
+function insertBackgroundImage(dataUrl) {
+  const img = new Image();
+  img.onload = () => {
+    const dpr = window.devicePixelRatio || 1;
+    const topLeft = screenToWorld(0, 0);
+    const bottomRight = screenToWorld(canvas.width / dpr, canvas.height / dpr);
+    const cx = (topLeft.x + bottomRight.x) / 2, cy = (topLeft.y + bottomRight.y) / 2;
+    const aspect = img.naturalWidth / img.naturalHeight;
+    let w = (bottomRight.x - topLeft.x) * 0.6, h = w / aspect;
+    if (h > (bottomRight.y - topLeft.y) * 0.6) { h = (bottomRight.y - topLeft.y) * 0.6; w = h * aspect; }
+    const rec = { id: nextBgImageId++, dataUrl, el: img, x1: cx - w / 2, y1: cy - h / 2, x2: cx + w / 2, y2: cy + h / 2 };
+    backgroundImages.push(rec);
+    selectedShapeIds.clear();
+    selectedBgImageId = rec.id;
+    setTool('select');
+    markProjectDirty();
+  };
+  img.src = dataUrl;
+}
+
 btnUndo.addEventListener('click', () => {
   if (currentTool === 'line' && drawingPoints.length > 0) {
     drawingPoints.pop();
@@ -2136,18 +2697,22 @@ function doClearSketch() {
   closePointEditor(false);
   closeFilletEditor(false);
   endDrag();
+  endBgImageDrag();
   faceSelectMode = false;
   faceEditContext = null;
   baseRollback = false;
   selectedShapeIds.clear();
+  selectedBgImageId = null;
   clearHoverHighlight();
   clearSelectedHighlight();
 
   shapes = [];
   history = [];
   faceFeatures = [];
+  backgroundImages = [];
   nextShapeId = 1;
   nextFeatureId = 1;
+  nextBgImageId = 1;
 
   if (extrudedGroup) {
     viewerScene.remove(extrudedGroup);
@@ -2292,7 +2857,7 @@ function shapeToDrawing(shape, flipY) {
   if (shape.type === 'circle') {
     return R.drawCircle(shape.radius).translate(shape.center.x, sign * shape.center.y);
   }
-  const pts = getFilletedPoints(shape);
+  const pts = getOutlinePoints(shape);
   let pen = R.draw([pts[0].x, sign * pts[0].y]);
   for (let i = 1; i < pts.length; i++) pen = pen.lineTo([pts[i].x, sign * pts[i].y]);
   return pen.close();
@@ -2397,9 +2962,28 @@ async function rebuildSolid() {
 
   if (!viewerScene) initViewer();
 
-  const base = buildBaseGroup();
-  if (!base) {
-    extrudeStatusEl.textContent = 'Keine geschlossene Form zum Extrudieren vorhanden.';
+  const warnings = [];
+  let base, finalGroup;
+  try {
+    base = buildBaseGroup();
+    if (!base) {
+      extrudeStatusEl.textContent = 'Keine geschlossene Form zum Extrudieren vorhanden.';
+      updateFaceEditUI();
+      return;
+    }
+    // The base group is already one fully BREP-fused solid (see buildBaseGroup);
+    // if face features exist, replay them on top of it.
+    finalGroup = faceFeatures.length === 0 ? base.group : applyFaceFeatures(base.solid, base.material, warnings);
+  } catch (err) {
+    // OpenCascade doesn't validate a sketch profile up front - a self-intersecting
+    // outline (most often an over-bent curved line, see MAX_BULGE, or two shapes
+    // overlapping in a way their boolean fuse/cut can't resolve) only surfaces here,
+    // deep inside solid-building, as an opaque WASM exception with no useful message -
+    // so this can't point at which shape/edge is at fault, only that something is invalid.
+    // The previous (still valid) model, if any, is deliberately left alone in the viewer
+    // rather than cleared, so a failed re-extrude doesn't also blank out the last good result.
+    console.error('Extrusion fehlgeschlagen:', err);
+    extrudeStatusEl.textContent = 'Extrusion fehlgeschlagen - vermutlich überschneidet sich eine Kontur selbst (z.B. eine zu stark gebogene Linie). Form anpassen und erneut versuchen.';
     updateFaceEditUI();
     return;
   }
@@ -2408,12 +2992,6 @@ async function rebuildSolid() {
     viewerScene.remove(extrudedGroup);
     extrudedGroup = null;
   }
-
-  const warnings = [];
-
-  // The base group is already one fully BREP-fused solid (see buildBaseGroup);
-  // if face features exist, replay them on top of it.
-  const finalGroup = faceFeatures.length === 0 ? base.group : applyFaceFeatures(base.solid, base.material, warnings);
 
   viewerScene.add(finalGroup);
   extrudedGroup = finalGroup;
@@ -2939,7 +3517,9 @@ function enterFaceEditMode(pick) {
   closePointEditor(false);
   closeFilletEditor(false);
   endDrag();
+  endBgImageDrag();
   selectedShapeIds.clear();
+  selectedBgImageId = null;
   baseRollback = false;
 
   const existingIdx = pick.featureId ? faceFeatures.findIndex((f) => f.id === pick.featureId) : -1;
@@ -2952,6 +3532,7 @@ function enterFaceEditMode(pick) {
     innerLoopsUV: pick.innerLoopsUV || [],
     baseShapes: shapes,
     baseHistory: history,
+    baseBackgroundImages: backgroundImages,
   };
 
   // Re-editing an existing feature: temporarily roll the 3D view back to how
@@ -2966,6 +3547,10 @@ function enterFaceEditMode(pick) {
   // commits `shapes` back onto it - otherwise "Abbrechen" couldn't undo them.
   shapes = existing ? JSON.parse(JSON.stringify(existing.shapes)) : [];
   history = [];
+  // Shallow-clone (not deep, unlike shapes above) since each entry carries a
+  // loaded HTMLImageElement in `el` that JSON.stringify can't round-trip -
+  // "Abbrechen" only needs to discard position/size edits, not the image itself.
+  backgroundImages = existing ? (existing.backgroundImages || []).map(bg => ({ ...bg })) : [];
 
   fitViewToLoop(pick.boundaryLoopUV);
   renderShapeList();
@@ -2980,13 +3565,16 @@ function exitFaceEditMode(commit) {
   closePointEditor(false);
   closeFilletEditor(false);
   endDrag();
+  endBgImageDrag();
   selectedShapeIds.clear();
+  selectedBgImageId = null;
 
   const ctx = faceEditContext;
   if (commit) {
     if (ctx.featureId) {
       const f = faceFeatures.find((x) => x.id === ctx.featureId);
       f.shapes = shapes;
+      f.backgroundImages = backgroundImages;
     } else {
       faceFeatures.push({
         id: nextFeatureId++,
@@ -2994,6 +3582,7 @@ function exitFaceEditMode(commit) {
         boundaryLoopUV: ctx.boundaryLoopUV,
         innerLoopsUV: ctx.innerLoopsUV,
         shapes: shapes,
+        backgroundImages: backgroundImages,
       });
     }
     markProjectDirty();
@@ -3001,6 +3590,7 @@ function exitFaceEditMode(commit) {
 
   shapes = ctx.baseShapes;
   history = ctx.baseHistory;
+  backgroundImages = ctx.baseBackgroundImages;
   faceEditContext = null;
   clearSelectedHighlight();
   clearHoverHighlight();
@@ -3214,6 +3804,7 @@ function serializeProject() {
     nextShapeId,
     nextFeatureId,
     shapes,
+    backgroundImages: backgroundImages.map(bg => ({ id: bg.id, dataUrl: bg.dataUrl, x1: bg.x1, y1: bg.y1, x2: bg.x2, y2: bg.y2 })),
     faceFeatures: faceFeatures.map(f => ({
       id: f.id,
       basis: {
@@ -3225,6 +3816,7 @@ function serializeProject() {
       boundaryLoopUV: f.boundaryLoopUV,
       innerLoopsUV: f.innerLoopsUV,
       shapes: f.shapes,
+      backgroundImages: (f.backgroundImages || []).map(bg => ({ id: bg.id, dataUrl: bg.dataUrl, x1: bg.x1, y1: bg.y1, x2: bg.x2, y2: bg.y2 })),
     })),
   };
 }
@@ -3273,6 +3865,20 @@ loadProjectInput.addEventListener('change', () => {
   reader.readAsText(file);
 });
 
+// Reconstructs background-image records from a project file's plain
+// {id,dataUrl,x1,y1,x2,y2} entries, kicking off an async decode of each
+// dataUrl into an HTMLImageElement - render() is called again once each
+// image finishes loading, since drawBackgroundImages() can't draw it before then.
+function hydrateBackgroundImages(list) {
+  return (list || []).map(rec => {
+    const bg = { id: rec.id, dataUrl: rec.dataUrl, x1: rec.x1, y1: rec.y1, x2: rec.x2, y2: rec.y2, el: null };
+    const img = new Image();
+    img.onload = () => { bg.el = img; render(); };
+    img.src = rec.dataUrl;
+    return bg;
+  });
+}
+
 // Restores full editing state (base sketch, extrusion depth, face features)
 // from a parsed project file, then rebuilds the 3D model.
 function loadProject(data) {
@@ -3281,16 +3887,19 @@ function loadProject(data) {
   closePointEditor(false);
   closeFilletEditor(false);
   endDrag();
+  endBgImageDrag();
   faceSelectMode = false;
   faceEditContext = null;
   baseRollback = false;
   selectedShapeIds.clear();
+  selectedBgImageId = null;
   panState = null;
   clearHoverHighlight();
   clearSelectedHighlight();
 
   shapes = data.shapes;
   history = [];
+  backgroundImages = hydrateBackgroundImages(data.backgroundImages);
 
   // Migrate project files saved before per-shape height/depth existed: back
   // then, a plain (neither isHole nor isAdditive) shape extruded to one
@@ -3316,12 +3925,15 @@ function loadProject(data) {
     boundaryLoopUV: f.boundaryLoopUV,
     innerLoopsUV: f.innerLoopsUV || [],
     shapes: f.shapes,
+    backgroundImages: hydrateBackgroundImages(f.backgroundImages),
   }));
 
   const maxShapeId = shapes.reduce((m, s) => Math.max(m, s.id || 0), 0);
   const maxFeatureId = faceFeatures.reduce((m, f) => Math.max(m, f.id || 0), 0);
   nextShapeId = data.nextShapeId || (maxShapeId + 1);
   nextFeatureId = data.nextFeatureId || (maxFeatureId + 1);
+  const allBgIds = backgroundImages.map(b => b.id).concat(faceFeatures.flatMap(f => f.backgroundImages.map(b => b.id)));
+  nextBgImageId = allBgIds.length ? Math.max(...allBgIds) + 1 : 1;
 
   projectDirty = false;
   markDirty();

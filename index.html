@@ -19,10 +19,12 @@
     <div class="toolbar-row">
       <div class="logo">MR-CAD (BREP)</div>
       <div class="group">
+        <button id="btn-insert-bg-image" title="Hintergrundbild (JPG/PNG) als Zeichenvorlage in die aktuelle Skizze einfügen - liegt hinter dem Raster. Mit dem Auswahl-Tool verschieben oder an den 4 Ecken frei skalieren. Bei einer neuen Skizze auf einer Fläche ist kein Bild vorhanden.">🖼 Hintergrundbild einfügen</button>
+        <input type="file" id="bg-image-input" accept="image/*" style="display:none">
         <button id="tool-select" class="tool" title="Form(en) auswählen und verschieben. Strg+Klick: mehrere Formen zur Auswahl hinzufügen/entfernen">↖ Auswahl</button>
         <button id="tool-dimension" class="tool" title="Auf eine Linie oder einen Kreis klicken, um Länge/Radius einzugeben">📏 Maße</button>
         <button id="tool-origin" class="tool" title="Eckpunkt oder Mittelpunkt anklicken, um ihn als neuen Ursprung (0,0) zu setzen">⌂ Ursprung setzen</button>
-        <button id="tool-point" class="tool" title="Eckpunkte einer Linienform oder den Mittelpunkt einer Form anklicken, um die Welt-Koordinaten anzuzeigen und zu bearbeiten">⌖ Punkte</button>
+        <button id="tool-point" class="tool" title="Eckpunkte einer Linienform oder den Mittelpunkt einer Form anklicken, um die Welt-Koordinaten anzuzeigen und zu bearbeiten - oder anklicken und ziehen, um direkt zu verschieben (Snap-Raster)">⌖ Punkte</button>
         <button id="tool-edge" class="tool" title="Linie einer Linienform anklicken (nahe einer Ecke), um dort einen Rundungsradius einzugeben">⌒ Linien</button>
       </div>
       <div class="group">
@@ -84,10 +86,14 @@
         <span id="face-edit-label">Formen auf dieser Fläche: „Aufaddieren“ = Erhebung, „Loch“ = Ausschnitt (echtes Boolean-Schneiden). Mit „⬆ Extrudieren“ übernehmen.</span>
         <button id="btn-cancel-face-edit">✕ Abbrechen</button>
       </div>
-      <div id="sketch-hint">Linien-Tool: Punkte anklicken, mit Doppelklick oder Enter schließen. Alt+Klick auf eine bestehende Linie: als Referenzlinie übernehmen (nächstes Segment richtet sich an deren Winkel aus). Strg gedrückt halten: aktuellen Winkel fixieren, Länge kann an anderen Linien einschnappen. Kreis-Tool: Klick = Mittelpunkt, dann ziehen und klicken = Radius. Rechteck-Tool: Klick = erste Ecke, Klick = gegenüberliegende Ecke. Vieleck-Tools (3/5/6/8-Eck): Klick = Mittelpunkt, dann ziehen und klicken = Radius und Ausrichtung. Text-Tool: rechts Einstellungen wählen, dann klicken = linker Rand der Grundlinie. Lochkreis-Tool: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken - wechselt danach automatisch ins Punkte-Tool zur Feinjustierung. Vor dem Extrudieren für jede Form im Formen-Optionsmenü „Loch“ oder „Aufaddieren“ sowie die eigene Höhe/Tiefe wählen. Auswahl-Tool: Strg+Klick fügt eine Form der Auswahl hinzu/entfernt sie, mehrere ausgewählte Formen lassen sich gemeinsam verschieben. Punkte-Tool: Eckpunkt oder Mittelpunkt anklicken, um die Koordinaten zu bearbeiten. Linien-Tool (⌒): Linie einer Linienform nahe einer Ecke anklicken, um dort einen Rundungsradius einzugeben (0 oder leer = scharfe Ecke). Mausrad: Zoom. Mittlere Maustaste ziehen: Ansicht verschieben.</div>
+      <div id="sketch-hint">Linien-Tool: Punkte anklicken, mit Doppelklick oder Enter schließen. Alt+Klick auf eine bestehende Linie: als Referenzlinie übernehmen (nächstes Segment richtet sich an deren Winkel aus). Strg gedrückt halten: aktuellen Winkel fixieren, Länge kann an anderen Linien einschnappen oder sich mit einem beliebigen anderen Punkt (z.B. dem Startpunkt) auf gleiche Höhe/Breite ausrichten, unabhängig vom Snap-Raster. Umschalt (Shift) beim Setzen des Endpunkts gedrückt halten: biegt das gerade gesetzte Segment zu einem Bogen, Stärke/Richtung folgt der Maus - loslassen übernimmt die Biegung, weiter normal klicken (ohne Shift) für gerade Segmente (beliebig mischbar). Nachträglich lässt sich ein bereits gesetztes Segment so nicht mehr biegen. Kreis-Tool: Klick = Mittelpunkt, dann ziehen und klicken = Radius. Rechteck-Tool: Klick = erste Ecke, Klick = gegenüberliegende Ecke. Vieleck-Tools (3/5/6/8-Eck): Klick = Mittelpunkt, dann ziehen und klicken = Radius und Ausrichtung. Text-Tool: rechts Einstellungen wählen, dann klicken = linker Rand der Grundlinie. Lochkreis-Tool: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken - wechselt danach automatisch ins Punkte-Tool zur Feinjustierung. Vor dem Extrudieren für jede Form im Formen-Optionsmenü „Loch“ oder „Aufaddieren“ sowie die eigene Höhe/Tiefe wählen. Auswahl-Tool: Strg+Klick fügt eine Form der Auswahl hinzu/entfernt sie, mehrere ausgewählte Formen lassen sich gemeinsam verschieben. Punkte-Tool: Eckpunkt oder Mittelpunkt anklicken, um die Koordinaten zu bearbeiten, oder anklicken und ziehen, um ihn direkt zu verschieben (rastet auf dem Snap-Raster ein). Linien-Tool (⌒): Linie einer Linienform nahe einer Ecke anklicken, um dort einen Rundungsradius einzugeben (0 oder leer = scharfe Ecke). Mausrad: Zoom. Mittlere Maustaste ziehen: Ansicht verschieben.</div>
     </div>
 
     <div id="side-panel">
+      <div class="panel-block" id="shortcuts-panel-block">
+        <h3 id="shortcuts-title">Shortcuts</h3>
+        <div id="shortcuts-list"></div>
+      </div>
       <div class="panel-block">
         <h3>Formen</h3>
         <div id="shape-list"></div>

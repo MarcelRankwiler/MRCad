@@ -253,6 +253,27 @@ input[type=number] {
 .button-row .side-btn { flex: 1; padding: 6px; font-size: 12px; }
 .side-btn.active { background: #4a9eff; border-color: #4a9eff; color: white; }
 
+#shortcuts-panel-block { background: #1e1f22; border: 1px solid #35363a; border-radius: 6px; padding: 12px 14px; }
+#shortcuts-list { display: flex; flex-direction: column; }
+.shortcut-row { padding: 8px 0; border-bottom: 1px solid #303136; }
+.shortcut-row:last-child { padding-bottom: 2px; border-bottom: none; }
+.shortcut-row:first-child { padding-top: 0; }
+.shortcut-key {
+  display: inline-block;
+  background: #2a2b2e;
+  border: 1px solid #4a4b4e;
+  border-radius: 4px;
+  padding: 2px 7px;
+  margin-bottom: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: #8ecbff;
+  white-space: nowrap;
+}
+.shortcut-desc { display: block; font-size: 12.5px; line-height: 1.45; color: #c7c7cd; }
+
 #shape-list { display: flex; flex-direction: column; gap: 4px; max-height: 200px; overflow-y: auto; }
 .shape-item {
   background: #303134;
