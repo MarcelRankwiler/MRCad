@@ -50,28 +50,40 @@ try {
     $context = $listener.GetContext()
     $request = $context.Request
     $response = $context.Response
+    # Keep-alive + manually-set Content-Length is a known HttpListener footgun
+    # (a reused/pipelined connection can trip "bytes exceed Content-Length" and
+    # kill the whole loop below) - force a fresh connection per request instead.
+    $response.KeepAlive = $false
 
-    $urlPath = [System.Uri]::UnescapeDataString($request.Url.AbsolutePath)
-    if ($urlPath -eq '/') { $urlPath = '/index.html' }
-    $filePath = Join-Path $root ($urlPath -replace '^/', '')
-    $fullRoot = (Resolve-Path $root).Path
-    $resolved = $null
-    if (Test-Path $filePath) { $resolved = (Resolve-Path $filePath).Path }
+    try {
+      $urlPath = [System.Uri]::UnescapeDataString($request.Url.AbsolutePath)
+      if ($urlPath -eq '/') { $urlPath = '/index.html' }
+      $filePath = Join-Path $root ($urlPath -replace '^/', '')
+      $fullRoot = (Resolve-Path $root).Path
+      $resolved = $null
+      if (Test-Path $filePath) { $resolved = (Resolve-Path $filePath).Path }
 
-    if ($resolved -and $resolved.StartsWith($fullRoot) -and -not (Get-Item $resolved).PSIsContainer) {
-      $ext = [System.IO.Path]::GetExtension($resolved).ToLower()
-      $contentType = $mimeTypes[$ext]
-      if (-not $contentType) { $contentType = 'application/octet-stream' }
-      $bytes = [System.IO.File]::ReadAllBytes($resolved)
-      $response.ContentType = $contentType
-      $response.ContentLength64 = $bytes.Length
-      $response.OutputStream.Write($bytes, 0, $bytes.Length)
-    } else {
-      $response.StatusCode = 404
-      $notFound = [System.Text.Encoding]::UTF8.GetBytes("404 - Nicht gefunden: $urlPath")
-      $response.OutputStream.Write($notFound, 0, $notFound.Length)
+      if ($resolved -and $resolved.StartsWith($fullRoot) -and -not (Get-Item $resolved).PSIsContainer) {
+        $ext = [System.IO.Path]::GetExtension($resolved).ToLower()
+        $contentType = $mimeTypes[$ext]
+        if (-not $contentType) { $contentType = 'application/octet-stream' }
+        $bytes = [System.IO.File]::ReadAllBytes($resolved)
+        $response.ContentType = $contentType
+        $response.ContentLength64 = $bytes.Length
+        if ($request.HttpMethod -ne 'HEAD') { $response.OutputStream.Write($bytes, 0, $bytes.Length) }
+      } else {
+        $response.StatusCode = 404
+        $notFound = [System.Text.Encoding]::UTF8.GetBytes("404 - Nicht gefunden: $urlPath")
+        $response.ContentLength64 = $notFound.Length
+        if ($request.HttpMethod -ne 'HEAD') { $response.OutputStream.Write($notFound, 0, $notFound.Length) }
+      }
+    } catch {
+      # Don't let one bad request (bad Range header, client disconnect mid-write, ...)
+      # kill the listener loop and take down the whole dev server.
+      Write-Host "Request-Fehler ($($request.Url)): $_"
+    } finally {
+      $response.OutputStream.Close()
     }
-    $response.OutputStream.Close()
   }
 } finally {
   $listener.Stop()

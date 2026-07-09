@@ -21,10 +21,34 @@ html, body { margin: 0; height: 100%; font-family: -apple-system, Segoe UI, Aria
   flex-shrink: 0;
 }
 #toolbar .toolbar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 24px; }
+#toolbar .toolbar-row:not(.toolbar-row-main) { padding-left: calc(18px + 8px); }
 #toolbar .group { display: flex; align-items: center; gap: 6px; }
 #toolbar .group.section-divider { margin-left: auto; padding-left: 24px; border-left: 1px solid #3a3b3e; }
 #toolbar label { font-size: 13px; display: flex; align-items: center; gap: 4px; color: #b8b8b8; }
 #toolbar .logo { font-size: 18px; font-weight: 700; letter-spacing: 0.03em; color: #4a7dfc; margin-right: 8px; }
+
+#toolbar .tool-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 4px;
+  background: #232427;
+  border: 1px solid #35363a;
+  border-radius: 6px;
+}
+#toolbar .tool-tab-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8ecbff;
+  font-weight: 600;
+  padding: 2px 8px;
+  flex-shrink: 0;
+  border-right: 1px solid #3a3b3e;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+}
 
 button {
   background: #3a3b3e;
@@ -158,7 +182,7 @@ input[type=number] {
 #face-edit-controls button { flex-shrink: 0; }
 
 #history-panel {
-  width: 190px;
+  width: 260px;
   flex-shrink: 0;
   background: #26272a;
   border-right: 1px solid #3a3b3e;
@@ -166,7 +190,13 @@ input[type=number] {
   flex-direction: column;
   min-height: 0;
 }
-#history-tree { flex: 1; overflow-y: auto; padding: 10px 10px 10px 8px; }
+#history-tree { flex: 1 1 auto; overflow-y: auto; padding: 10px 10px 10px 8px; min-height: 60px; }
+#history-panel #shortcuts-panel-block {
+  flex: 0 0 auto;
+  max-height: 45%;
+  overflow-y: auto;
+  margin: 0 10px 10px 10px;
+}
 .history-item {
   display: flex;
   align-items: center;

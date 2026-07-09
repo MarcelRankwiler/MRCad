@@ -24,13 +24,16 @@ let circleCenter = null;  // in-progress circle center
 let shapeStartPoint = null; // in-progress rect/regular-polygon tool: first click (corner or center)
 let mousePos = null;      // current mouse position (canvas space), for previews
 let selectedShapeIds = new Set(); // Ctrl/Cmd-click adds/removes a shape in the 'select' tool, for multi-drag/multi-edit
+let errorShapeId = null;  // shape blamed for the most recent failed extrude (see buildBaseGroup/rebuildSolid) - drawn in red until the next extrude attempt
 let extrudedGroup = null; // THREE.Group currently in the viewer, exportable
 let dimEditor = null;     // active length/radius <input> overlay, if any
 let pointEditor = null;   // active point-mode X/Y <input> overlay, if any
 let filletEditor = null;  // active corner-radius <input> overlay, if any (see filletCornerArc)
+let pivotEditor = null;   // active center-point-tool pivot X/Y <input> overlay, if any (see openPivotEditor)
 let history = [];         // stack of previous `shapes` snapshots, for undo
 let dragState = null;     // active shape-drag: {shapeId, original, startRaw, dx, dy, moved}
 let pointDragState = null; // active point-tool drag: {hit, startRaw, moved, orig} - see updatePointDrag()
+let pivotDragState = null; // active center-point-tool drag: {hit, startRaw, moved, orig} - see updatePivotDrag()
 let backgroundImages = []; // reference images for the CURRENT sketch (base, or the active face feature) -
                             // {id, dataUrl (base64, persisted), el (loaded HTMLImageElement, NOT persisted),
                             //  x1,y1,x2,y2 (two diagonal world-space corners, order-independent)} - purely a
@@ -65,6 +68,24 @@ let meshVersion = 0;         // bumped whenever extrudedGroup is rebuilt; invali
 let faceAdjacencyCache = null; // {version, byObject: Map(mesh -> adjacency)}
 let hoverFaceHighlight = null;    // THREE.Mesh overlay for the currently hovered pickable face
 let selectedFaceHighlight = null; // THREE.Mesh overlay for the face currently being sketched on
+
+// ---- 3D edge fillets ---------------------------------------------------------
+// edgeFillets: ordered list of real BREP fillets applied to the finished solid
+// (after the base sketch and every face feature), each: {id, point:{x,y,z}, radius}.
+// `point` is the picked edge's own midpoint in fixed world coordinates at the moment
+// it was picked - same "fixed absolute position, doesn't chase the surface" approach
+// as face features (see applyFaceFeaturesSubset), and the only practical one here:
+// a filletted edge is consumed (replaced by a new rounded face and two new edges), so
+// there's no stable identity to track across rebuilds anyway - see applyEdgeFillets().
+let edgeFillets = [];
+let nextEdgeFilletId = 1;
+// The replicad Shape3D currently shown in the viewer (base + face features + edge
+// fillets) - kept around only so the 3D-edge tool can pick real BREP edges off of
+// exactly what's on screen; rebuilt alongside extrudedGroup, see rebuildSolid().
+let currentSolidForPicking = null;
+let hoverEdgeHighlight = null;    // THREE.Line overlay for the currently hovered pickable edge
+let selectedEdgeHighlight = null; // THREE.Line overlay for the edge pending a fillet radius
+let edgeFilletEditor = null;      // { input, wrap, point } - open radius input for a picked edge
 
 const CLOSE_SNAP_PX = 10;
 const SEGMENT_HIT_PX = 8;
@@ -657,10 +678,11 @@ function render() {
   if (faceEditContext) drawFaceReferenceOutline();
 
   // finished shapes
-  shapes.forEach(shape => drawShape(shape, selectedShapeIds.has(shape.id)));
+  shapes.forEach(shape => drawShape(shape, selectedShapeIds.has(shape.id), shape.id === errorShapeId));
 
   if (currentTool === 'dimension') drawDimensionLabels();
   if (currentTool === 'point' || currentTool === 'origin') drawPointHandles();
+  if (currentTool === 'centerpoint') drawCenterPivotHandles();
   if (currentTool === 'edge') drawEdgeHandles();
   if (currentTool === 'select') drawBackgroundImageHandles();
   drawDragLabel();
@@ -919,10 +941,12 @@ function drawBackgroundImageHandles() {
   [[bg.x1, bg.y1], [bg.x2, bg.y1], [bg.x1, bg.y2], [bg.x2, bg.y2]].forEach(([hx, hy]) => dot({ x: hx, y: hy }, '#ffcc55', 6));
 }
 
-function drawShape(shape, selected) {
-  const color = shape.isHole ? '#cc8b2c' : shape.isAdditive ? '#4a9eff' : (selected ? '#ffcc55' : '#5fd06b');
+function drawShape(shape, selected, isError) {
+  const color = isError ? '#ff3b30' : shape.isHole ? '#cc8b2c' : shape.isAdditive ? '#4a9eff' : (selected ? '#ffcc55' : '#5fd06b');
+  ctx.save();
   ctx.strokeStyle = color;
-  ctx.lineWidth = (selected ? 3 : 2) / viewScale;
+  ctx.lineWidth = (isError ? 4 : selected ? 3 : 2) / viewScale;
+  if (isError) ctx.setLineDash([8 / viewScale, 5 / viewScale]);
   ctx.beginPath();
   if (shape.type === 'polygon') {
     const pts = getOutlinePoints(shape);
@@ -935,6 +959,7 @@ function drawShape(shape, selected) {
   ctx.stroke();
   ctx.fillStyle = color + '22';
   ctx.fill();
+  ctx.restore();
 }
 
 // Draws the outline of the picked face (dashed, non-interactive) as a fixed
@@ -998,6 +1023,23 @@ function drawPointHandles() {
     if (s.groupId != null && !shownGroupCenters.has(s.groupId)) {
       shownGroupCenters.add(s.groupId);
       const c = groupCenterOf(s.groupId);
+      if (c) dot(c, '#37e6b3', 6);
+    }
+  });
+}
+
+// Center-point tool: highlights each shape's own pivot marker (orange) - its
+// stored override if the tool has moved it there, otherwise its natural center
+// (see effectivePivot) - plus each group's shared marker (teal, groupPivotOf).
+// Kept separate from drawPointHandles()/centroidOf(), which the Punkte tool
+// still uses to mean "the shape's actual position".
+function drawCenterPivotHandles() {
+  const shownGroups = new Set();
+  shapes.forEach(s => {
+    dot(effectivePivot(s), '#ff9f4a', 5);
+    if (s.groupId != null && !shownGroups.has(s.groupId)) {
+      shownGroups.add(s.groupId);
+      const c = groupPivotOf(s.groupId);
       if (c) dot(c, '#37e6b3', 6);
     }
   });
@@ -1095,7 +1137,15 @@ const TOOL_SHORTCUTS = {
     ['Klick', 'Eckpunkt oder Mittelpunkt anklicken, Koordinaten bearbeiten'],
     ['Klick + Ziehen', 'Punkt an neue Position schieben (rastet auf dem Snap-Raster ein)'],
   ],
+  centerpoint: [
+    ['Klick', 'Mittelpunkt-Marker anklicken, Koordinaten bearbeiten'],
+    ['Klick + Ziehen', 'Nur den Marker verschieben - Form bleibt an Ort und Stelle (rastet auf dem Snap-Raster ein)'],
+  ],
   edge: [['Klick nahe Ecke', 'Rundungsradius eingeben (0/leer = scharfe Ecke)']],
+  edge3d: [
+    ['Klick auf 3D-Kante', 'Rundungsradius (Fillet) eingeben, Enter übernimmt'],
+    ['Escape', 'Auswahl der Kante verwerfen'],
+  ],
 };
 
 function updateToolShortcuts() {
@@ -1112,13 +1162,20 @@ function setTool(tool) {
   closeLengthEditor(true);
   closePointEditor(true);
   closeFilletEditor(true);
+  closePivotEditor(true);
   endDrag();
   endBgImageDrag();
+  if (tool !== 'edge3d') {
+    closeEdgeFilletEditor(true);
+    clearHoverEdgeHighlight();
+    clearSelectedEdgeHighlight();
+    if (viewerRenderer) viewerRenderer.domElement.style.cursor = 'auto';
+  }
   document.querySelectorAll('.tool').forEach(b => b.classList.remove('active'));
   document.getElementById('tool-' + tool).classList.add('active');
   document.getElementById('text-panel-block').style.display = (tool === 'text') ? 'block' : 'none';
   document.getElementById('holecircle-panel-block').style.display = (tool === 'holecircle') ? 'block' : 'none';
-  canvas.style.cursor = (tool === 'select' || tool === 'dimension' || tool === 'point' || tool === 'edge' || tool === 'origin') ? 'pointer' : 'crosshair';
+  canvas.style.cursor = (tool === 'select' || tool === 'dimension' || tool === 'point' || tool === 'centerpoint' || tool === 'edge' || tool === 'origin') ? 'pointer' : 'crosshair';
   updateToolShortcuts();
   render();
 }
@@ -1188,6 +1245,7 @@ function markDirty() {
     viewerScene.remove(extrudedGroup);
     extrudedGroup = null;
   }
+  currentSolidForPicking = null;
   updateFaceEditUI();
 }
 
@@ -1204,6 +1262,7 @@ canvas.addEventListener('mousemove', (evt) => {
   if (dragState) updateDrag(mousePos);
   if (bgImageDragState) updateBgImageDrag(mousePos);
   if (pointDragState) updatePointDrag(mousePos);
+  if (pivotDragState) updatePivotDrag(mousePos);
   if (curveBulgeActive && curveBulgeEdgeIndex !== null) {
     const a = drawingPoints[curveBulgeEdgeIndex], b = bulgeEdgeEndpoint(curveBulgeEdgeIndex);
     const bulge = bulgeFromMouse(a, b, mousePos);
@@ -1223,6 +1282,7 @@ canvas.addEventListener('wheel', (evt) => {
   closeLengthEditor(true);
   closePointEditor(true);
   closeFilletEditor(true);
+  closePivotEditor(true);
   const rect = canvas.getBoundingClientRect();
   const sx = evt.clientX - rect.left;
   const sy = evt.clientY - rect.top;
@@ -1241,6 +1301,7 @@ canvas.addEventListener('mousedown', (evt) => {
   closeLengthEditor(true);
   closePointEditor(true);
   closeFilletEditor(true);
+  closePivotEditor(true);
   panState = { startX: evt.clientX, startY: evt.clientY, startOffset: { x: viewOffset.x, y: viewOffset.y } };
   canvas.style.cursor = 'grabbing';
 });
@@ -1389,8 +1450,8 @@ function endDrag() {
 // Point-tool: mousedown on a vertex/center/group-center starts a potential drag rather
 // than opening the coordinate editor immediately - endPointDrag() (on mouseup) decides
 // which one actually happened, based on whether the mouse moved enough to snap to a
-// different grid position in between. A plain click (no movement) still opens the editor,
-// same as before.
+// different grid position in between. A plain click (no movement) still opens the
+// editor, same as before.
 canvas.addEventListener('mousedown', (evt) => {
   if (currentTool !== 'point' || evt.button !== 0) return;
   closePointEditor(true); // applies+closes any editor left open from a previous point first,
@@ -1400,6 +1461,50 @@ canvas.addEventListener('mousedown', (evt) => {
   pointDragState = { hit, startRaw: raw, moved: false, orig: null };
   canvas.style.cursor = 'grabbing';
 });
+
+// Center-point tool: mousedown on a shape's/group's pivot marker starts a potential drag
+// of that marker only (see applyPivotMove) - never the shape's actual geometry. Same
+// drag-vs-click distinction as the Punkte tool above, via pivotDragState/endPivotDrag().
+canvas.addEventListener('mousedown', (evt) => {
+  if (currentTool !== 'centerpoint' || evt.button !== 0) return;
+  closePivotEditor(true);
+  const raw = getMousePos(evt);
+  const hit = hitTestCenterOnly(raw);
+  if (!hit) return;
+  pivotDragState = { hit, startRaw: raw, moved: false, orig: null };
+  canvas.style.cursor = 'grabbing';
+});
+
+function updatePivotDrag(raw) {
+  const g = getSnapSize();
+  const dx = snapValue(raw.x - pivotDragState.startRaw.x, g);
+  const dy = snapValue(raw.y - pivotDragState.startRaw.y, g);
+  if (dx === 0 && dy === 0) return;
+  if (!pivotDragState.moved) {
+    pushHistory(); // snapshot taken once, right before the marker actually starts moving
+    pivotDragState.moved = true;
+    pivotDragState.orig = { x: pivotDragState.hit.point.x, y: pivotDragState.hit.point.y };
+  }
+  const { hit, orig } = pivotDragState;
+  const next = { x: orig.x + dx, y: orig.y + dy };
+  if (hit.kind === 'groupcenter') {
+    shapes.filter(sh => sh.groupId === hit.groupId).forEach(sh => { sh.pivot = { x: next.x, y: next.y }; });
+  } else {
+    hit.shape.pivot = { x: next.x, y: next.y };
+  }
+  // A pivot move never touches actual geometry, so unlike updatePointDrag() this
+  // deliberately skips markDirty() - the current 3D model/export is still fully valid.
+  render();
+}
+
+function endPivotDrag() {
+  if (!pivotDragState) return;
+  const { hit, moved } = pivotDragState;
+  pivotDragState = null;
+  canvas.style.cursor = 'pointer';
+  if (moved) render();
+  else openPivotEditor(hit);
+}
 
 // Captures the original coordinates a point-tool drag will translate by delta, in the
 // same shape/kind-specific way applyPoint() interprets a hit (see there) - a plain {x,y}
@@ -1488,7 +1593,7 @@ function endBgImageDrag() {
   render();
 }
 
-window.addEventListener('mouseup', () => { endDrag(); endBgImageDrag(); endPan(); endPointDrag(); });
+window.addEventListener('mouseup', () => { endDrag(); endBgImageDrag(); endPan(); endPointDrag(); endPivotDrag(); });
 
 canvas.addEventListener('click', (evt) => {
   const raw = getMousePos(evt);
@@ -2060,6 +2165,34 @@ function hitTestPoint(pt) {
   return null;
 }
 
+// Center-point mode: same priority as hitTestPoint() (group marker first, then
+// each shape's own marker) but never matches a corner vertex, and targets each
+// shape's pivot marker (effectivePivot/groupPivotOf) rather than its actual
+// geometric center - see applyPivotMove().
+function hitTestCenterOnly(pt) {
+  const threshold = POINT_HIT_PX / viewScale;
+
+  const checkedGroups = new Set();
+  for (let i = shapes.length - 1; i >= 0; i--) {
+    const s = shapes[i];
+    if (s.groupId == null || checkedGroups.has(s.groupId)) continue;
+    checkedGroups.add(s.groupId);
+    const c = groupPivotOf(s.groupId);
+    if (c && dist(pt, c) <= threshold) {
+      return { shape: s, kind: 'groupcenter', groupId: s.groupId, index: null, point: c };
+    }
+  }
+
+  for (let i = shapes.length - 1; i >= 0; i--) {
+    const s = shapes[i];
+    const c = effectivePivot(s);
+    if (dist(pt, c) <= threshold) {
+      return { shape: s, kind: 'center', index: null, point: c };
+    }
+  }
+  return null;
+}
+
 function closeLengthEditor(apply) {
   if (!dimEditor) return;
   const { input, wrap, hit, anchor } = dimEditor;
@@ -2241,6 +2374,10 @@ function setOriginToPoint(point) {
     } else {
       s.center = { x: s.center.x - dx, y: s.center.y - dy };
     }
+    // Re-labeling the origin shifts every coordinate in the sketch, including any
+    // Mittelpunkt-tool pivot override - otherwise it would silently end up in the
+    // wrong place relative to everything else.
+    if (s.pivot) s.pivot = { x: s.pivot.x - dx, y: s.pivot.y - dy };
   });
   onShapesChanged();
   render();
@@ -2335,6 +2472,85 @@ function openPointEditor(hit) {
   inputX.select();
 }
 
+// Center-point tool: X/Y editor for a picked pivot marker - deliberately just
+// X/Y, no rotation field (unlike openPointEditor's) - rotating around a custom
+// pivot is a future tool, not this one; this only places the marker itself.
+function openPivotEditor(hit) {
+  closePivotEditor(true);
+
+  const screenPos = worldToScreen(hit.point.x, hit.point.y);
+  const wrap = document.createElement('div');
+  wrap.className = 'point-editor-wrap';
+  wrap.style.left = (canvas.offsetLeft + screenPos.x) + 'px';
+  wrap.style.top = (canvas.offsetTop + screenPos.y) + 'px';
+
+  const labelX = document.createElement('span');
+  labelX.className = 'point-editor-label';
+  labelX.textContent = 'X';
+
+  const inputX = document.createElement('input');
+  inputX.type = 'number';
+  inputX.className = 'point-editor';
+  inputX.step = '0.1';
+  inputX.value = hit.point.x.toFixed(1);
+
+  const labelY = document.createElement('span');
+  labelY.className = 'point-editor-label';
+  labelY.textContent = 'Y';
+
+  const inputY = document.createElement('input');
+  inputY.type = 'number';
+  inputY.className = 'point-editor';
+  inputY.step = '0.1';
+  inputY.value = hit.point.y.toFixed(1);
+
+  wrap.appendChild(labelX);
+  wrap.appendChild(inputX);
+  wrap.appendChild(labelY);
+  wrap.appendChild(inputY);
+
+  const fields = [inputX, inputY];
+  const onKeydown = (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') closePivotEditor(true);
+    else if (e.key === 'Escape') closePivotEditor(false);
+  };
+  const onBlur = (e) => { if (!fields.includes(e.relatedTarget)) closePivotEditor(true); };
+  fields.forEach(f => { f.addEventListener('keydown', onKeydown); f.addEventListener('blur', onBlur); });
+
+  document.getElementById('sketch-pane').appendChild(wrap);
+  pivotEditor = { inputX, inputY, wrap, hit };
+  inputX.focus();
+  inputX.select();
+}
+
+function closePivotEditor(apply) {
+  if (!pivotEditor) return;
+  const { inputX, inputY, wrap, hit } = pivotEditor;
+  pivotEditor = null; // clear first so the blur triggered by remove() below doesn't recurse
+  if (apply) {
+    const x = parseFloat(inputX.value);
+    const y = parseFloat(inputY.value);
+    if (!isNaN(x) && !isNaN(y)) applyPivotMove(hit, x, y);
+  }
+  wrap.remove();
+  render();
+}
+
+// Moves only the pivot marker to (x,y) - the shape's/group's actual geometry
+// (points/center) is untouched. A pure bookkeeping edit, not a geometry change,
+// so unlike applyPoint() this skips markDirty(): the current 3D model/export
+// is still fully valid.
+function applyPivotMove(hit, x, y) {
+  pushHistory();
+  if (hit.kind === 'groupcenter') {
+    shapes.filter(sh => sh.groupId === hit.groupId).forEach(sh => { sh.pivot = { x, y }; });
+  } else {
+    hit.shape.pivot = { x, y };
+  }
+  render();
+}
+
 function closeFilletEditor(apply) {
   if (!filletEditor) return;
   const { input, wrap, hit } = filletEditor;
@@ -2414,6 +2630,33 @@ function centroidOf(shape) {
   const n = shape.points.length;
   const sum = shape.points.reduce((a, p) => ({ x: a.x + p.x, y: a.y + p.y }), { x: 0, y: 0 });
   return { x: sum.x / n, y: sum.y / n };
+}
+
+// ---- Mittelpunkt-tool pivot markers -------------------------------------------
+// `shape.pivot` ({x,y}, optional) is a marker the center-point tool can drag
+// independently of the shape's actual geometry - meant as a future rotation
+// center (rotate the shape around an arbitrary point, not just its own true
+// center). Deliberately kept separate from centroidOf()/hitTestPoint(), which
+// the Punkte tool still uses to mean "the shape's real position" - dragging a
+// center there still translates the whole shape, unaffected by any pivot here.
+
+// Center-point tool marker for a single shape: its own pivot override if it's
+// been dragged there (see applyPivotMove), otherwise its natural center.
+function effectivePivot(shape) {
+  return shape.pivot ? { x: shape.pivot.x, y: shape.pivot.y } : centroidOf(shape);
+}
+
+// Center-point tool marker for a whole group (e.g. a hole-circle pattern or
+// placed text): the average of every member's own effectivePivot(), so the
+// group's shared marker follows if some/all members have a custom pivot.
+function groupPivotOf(groupId) {
+  const members = shapes.filter(s => s.groupId === groupId);
+  if (members.length === 0) return null;
+  const sum = members.reduce((a, s) => {
+    const c = effectivePivot(s);
+    return { x: a.x + c.x, y: a.y + c.y };
+  }, { x: 0, y: 0 });
+  return { x: sum.x / members.length, y: sum.y / members.length };
 }
 
 // Rotates `p` around `center` by `angleDeg` degrees. Positive = clockwise on
@@ -2637,7 +2880,9 @@ document.getElementById('tool-select').addEventListener('click', () => setTool('
 document.getElementById('tool-dimension').addEventListener('click', () => setTool('dimension'));
 document.getElementById('tool-origin').addEventListener('click', () => setTool('origin'));
 document.getElementById('tool-point').addEventListener('click', () => setTool('point'));
+document.getElementById('tool-centerpoint').addEventListener('click', () => setTool('centerpoint'));
 document.getElementById('tool-edge').addEventListener('click', () => setTool('edge'));
+document.getElementById('tool-edge3d').addEventListener('click', () => setTool('edge3d'));
 
 updateToolShortcuts(); // reflect the initial tool ('line') before any button is clicked
 
@@ -2691,11 +2936,13 @@ btnUndo.addEventListener('click', () => {
 });
 
 function doClearSketch() {
-  if (shapes.length > 0 || faceFeatures.length > 0) markProjectDirty();
+  if (shapes.length > 0 || faceFeatures.length > 0 || edgeFillets.length > 0) markProjectDirty();
   cancelInProgress();
   closeLengthEditor(false);
   closePointEditor(false);
   closeFilletEditor(false);
+  closePivotEditor(false);
+  closeEdgeFilletEditor(false);
   endDrag();
   endBgImageDrag();
   faceSelectMode = false;
@@ -2705,13 +2952,17 @@ function doClearSketch() {
   selectedBgImageId = null;
   clearHoverHighlight();
   clearSelectedHighlight();
+  clearHoverEdgeHighlight();
+  clearSelectedEdgeHighlight();
 
   shapes = [];
   history = [];
   faceFeatures = [];
+  edgeFillets = [];
   backgroundImages = [];
   nextShapeId = 1;
   nextFeatureId = 1;
+  nextEdgeFilletId = 1;
   nextBgImageId = 1;
 
   if (extrudedGroup) {
@@ -2720,10 +2971,12 @@ function doClearSketch() {
     meshVersion++;
     faceAdjacencyCache = null;
   }
+  currentSolidForPicking = null;
   btnExport.disabled = true;
   extrudeStatusEl.textContent = '';
 
   renderShapeList();
+  renderEdgeFilletList();
   renderHistoryTree();
   updateFaceEditUI();
   render();
@@ -2911,12 +3164,31 @@ function buildBaseGroup() {
   let solid = null;
   additives.forEach(add => {
     const h = Math.max(0.01, parseFloat(add.additiveHeight) || 5);
-    const piece = replicadSidedSolid(add, h, add.additiveSide);
-    solid = solid ? solid.fuse(piece) : piece;
+    try {
+      const piece = replicadSidedSolid(add, h, add.additiveSide);
+      solid = solid ? solid.fuse(piece) : piece;
+    } catch (err) {
+      // Don't try to tag the caught value itself: OpenCascade/replicad failures
+      // surface here as opaque WASM exceptions, which are frequently a bare
+      // number or a non-extensible object rather than a real Error - silently
+      // dropping `.failedShapeId` on those left rebuildSolid() with nothing to
+      // highlight. Throwing our own Error instead guarantees the tag survives.
+      console.error('replicadSidedSolid failed for shape', add.id, err);
+      const tagged = new Error('extrude failed for shape ' + add.id);
+      tagged.failedShapeId = add.id;
+      throw tagged;
+    }
   });
   holes.forEach(hole => {
     const d = Math.max(0.01, parseFloat(hole.holeDepth) || 5);
-    solid = solid.cut(replicadSidedSolid(hole, d, hole.additiveSide));
+    try {
+      solid = solid.cut(replicadSidedSolid(hole, d, hole.additiveSide));
+    } catch (err) {
+      console.error('replicadSidedSolid/cut failed for shape', hole.id, err);
+      const tagged = new Error('extrude failed for shape ' + hole.id);
+      tagged.failedShapeId = hole.id;
+      throw tagged;
+    }
   });
 
   // The solid is deliberately left at the sketch's own coordinates (Z=0 at
@@ -2962,28 +3234,59 @@ async function rebuildSolid() {
 
   if (!viewerScene) initViewer();
 
+  const hadErrorShape = errorShapeId != null;
+  errorShapeId = null;
+
   const warnings = [];
-  let base, finalGroup;
+  let base, finalGroup, finalSolid;
   try {
     base = buildBaseGroup();
     if (!base) {
+      if (hadErrorShape) render();
       extrudeStatusEl.textContent = 'Keine geschlossene Form zum Extrudieren vorhanden.';
       updateFaceEditUI();
       return;
     }
     // The base group is already one fully BREP-fused solid (see buildBaseGroup);
     // if face features exist, replay them on top of it.
-    finalGroup = faceFeatures.length === 0 ? base.group : applyFaceFeatures(base.solid, base.material, warnings);
+    if (faceFeatures.length === 0) {
+      finalGroup = base.group;
+      finalSolid = base.solid;
+    } else {
+      const result = applyFaceFeatures(base.solid, base.material, warnings);
+      finalGroup = result.group;
+      finalSolid = result.solid;
+    }
+    // Edge fillets are always the very last step, applied on top of the base +
+    // face features (see edgeFillets above/applyEdgeFillets) - re-mesh only if
+    // there actually are any, no point re-triangulating an unfilletted solid.
+    if (edgeFillets.length > 0) {
+      finalSolid = applyEdgeFillets(finalSolid, edgeFillets, warnings);
+      finalGroup = new THREE.Group();
+      finalGroup.add(replicadShapeToMesh(finalSolid, base.material));
+    }
   } catch (err) {
     // OpenCascade doesn't validate a sketch profile up front - a self-intersecting
     // outline (most often an over-bent curved line, see MAX_BULGE, or two shapes
     // overlapping in a way their boolean fuse/cut can't resolve) only surfaces here,
-    // deep inside solid-building, as an opaque WASM exception with no useful message -
-    // so this can't point at which shape/edge is at fault, only that something is invalid.
+    // deep inside solid-building, as an opaque WASM exception with no useful message.
+    // buildBaseGroup() tags the exception with the shape it was building when it blew
+    // up (failedShapeId) so we can at least point at *a* likely culprit - not proof the
+    // shape itself is invalid (a fuse/cut against an otherwise-fine neighbour can also
+    // fail this way), but a much better starting point than "something, somewhere".
     // The previous (still valid) model, if any, is deliberately left alone in the viewer
     // rather than cleared, so a failed re-extrude doesn't also blank out the last good result.
     console.error('Extrusion fehlgeschlagen:', err);
-    extrudeStatusEl.textContent = 'Extrusion fehlgeschlagen - vermutlich überschneidet sich eine Kontur selbst (z.B. eine zu stark gebogene Linie). Form anpassen und erneut versuchen.';
+    const idx = err.failedShapeId != null ? shapes.findIndex(s => s.id === err.failedShapeId) : -1;
+    if (idx !== -1) {
+      errorShapeId = err.failedShapeId;
+      selectedShapeIds = new Set([err.failedShapeId]);
+      extrudeStatusEl.textContent = `Extrusion fehlgeschlagen bei Form ${idx + 1} (${shapeLabel(shapes[idx])}, rot markiert in der Skizze) - vermutlich überschneidet sich ihre Kontur selbst (z.B. eine zu stark gebogene Linie). Form anpassen und erneut versuchen.`;
+    } else {
+      extrudeStatusEl.textContent = 'Extrusion fehlgeschlagen - vermutlich überschneidet sich eine Kontur selbst (z.B. eine zu stark gebogene Linie). Form anpassen und erneut versuchen.';
+    }
+    render();
+    renderShapeList();
     updateFaceEditUI();
     return;
   }
@@ -2995,14 +3298,17 @@ async function rebuildSolid() {
 
   viewerScene.add(finalGroup);
   extrudedGroup = finalGroup;
+  currentSolidForPicking = finalSolid;
   meshVersion++;
   faceAdjacencyCache = null;
 
   frameCameraToGroup(finalGroup);
 
+  if (hadErrorShape) render();
   extrudeStatusEl.textContent = warnings.join(' ');
   btnExport.disabled = false;
   updateFaceEditUI();
+  renderEdgeFilletList();
 }
 
 btnExtrude.addEventListener('click', () => {
@@ -3356,11 +3662,79 @@ function applyFaceFeaturesSubset(baseSolid, material, featureList, warnings) {
 
   const group = new THREE.Group();
   group.add(replicadShapeToMesh(solid, material));
-  return group;
+  return { group, solid };
 }
 
 function applyFaceFeatures(baseSolid, material, warnings) {
   return applyFaceFeaturesSubset(baseSolid, material, faceFeatures, warnings);
+}
+
+// ---- 3D edge fillets: geometry helpers ---------------------------------------
+
+// Samples an edge's curve into `n` world-space points (replicad's Edge.pointAt()
+// is normalized 0..1 across the curve's own parameter range - straight or curved,
+// closed or not) - used for picking, re-matching across rebuilds, and highlighting.
+function sampleEdgePoints(edge, n) {
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const v = edge.pointAt(i / n);
+    pts.push({ x: v.x, y: v.y, z: v.z });
+  }
+  return pts;
+}
+
+// More samples for longer/curved edges (so a big fillet's own rounded edges or a
+// large circular edge still get enough points), fewer for short straight ones.
+function edgeSampleCount(edge) {
+  let len = 0;
+  try { len = edge.length; } catch (err) { /* degenerate edge - fall through with len=0 */ }
+  return Math.max(6, Math.min(48, Math.round(len / 2) + 6));
+}
+
+// Finds whichever edge of `solid` passes closest to world-space `point` - used
+// both to re-identify a stored fillet's edge on a freshly rebuilt solid (see
+// applyEdgeFillets) and, from the 3D-edge tool, to find the edge nearest a
+// raycast hit (see pickEdgeForViewerEvent). Plain nearest-sample-point search
+// rather than exact BREP identity: robust across rebuilds since a rebuilt solid
+// is geometrically identical (deterministic replay of the same operations) even
+// though every Edge wrapper is a brand new JS/OCC object each time.
+function findNearestEdge(solid, point) {
+  let best = null, bestDist = Infinity;
+  let edges;
+  try { edges = solid.edges; } catch (err) { return null; }
+  edges.forEach((edge) => {
+    sampleEdgePoints(edge, edgeSampleCount(edge)).forEach((p) => {
+      const d = Math.hypot(p.x - point.x, p.y - point.y, p.z - point.z);
+      if (d < bestDist) { bestDist = d; best = edge; }
+    });
+  });
+  return best;
+}
+
+// Applies every stored edge fillet in order, each re-identified on the current
+// (in-progress) solid by the world-space point it was picked at - same "fixed
+// position, doesn't chase the surface" approach as face features (see
+// applyFaceFeaturesSubset): a filletted edge is consumed by the operation
+// (replaced with a new rounded face and two new edges), so there's no lasting
+// identity to track anyway, only where it used to be.
+function applyEdgeFillets(solid, filletList, warnings) {
+  filletList.forEach((f, idx) => {
+    const edge = findNearestEdge(solid, f.point);
+    if (!edge) {
+      warnings.push(`Kantenrundung #${idx + 1}: Kante nicht mehr gefunden, übersprungen.`);
+      return;
+    }
+    try {
+      solid = solid.fillet(f.radius, (finder) => {
+        finder.filters.push(({ element }) => element.isSame(edge));
+        return finder;
+      });
+    } catch (err) {
+      console.error('Kantenrundung fehlgeschlagen:', err);
+      warnings.push(`Kantenrundung #${idx + 1} (R${f.radius} mm) konnte nicht angewendet werden (Radius evtl. zu groß für diese Kante), übersprungen.`);
+    }
+  });
+  return solid;
 }
 
 // Shows a temporary preview of the solid as it existed right before a given
@@ -3374,6 +3748,9 @@ async function showRollbackPreview(featureCount) {
     viewerScene.remove(extrudedGroup);
     extrudedGroup = null;
   }
+  // Not a real end-of-timeline model (it deliberately omits edge fillets and any
+  // features past featureCount) - not meant for the 3D-edge tool to pick against.
+  currentSolidForPicking = null;
   await window.ocReadyPromise;
   const base = buildBaseGroup();
   btnExport.disabled = true;
@@ -3382,7 +3759,7 @@ async function showRollbackPreview(featureCount) {
     return;
   }
   const warnings = [];
-  const group = featureCount === 0 ? base.group : applyFaceFeaturesSubset(base.solid, base.material, faceFeatures.slice(0, featureCount), warnings);
+  const group = featureCount === 0 ? base.group : applyFaceFeaturesSubset(base.solid, base.material, faceFeatures.slice(0, featureCount), warnings).group;
   viewerScene.add(group);
   extrudedGroup = group;
   meshVersion++;
@@ -3441,6 +3818,66 @@ function clearSelectedHighlight() {
   }
 }
 
+// ---- 3D edge fillets: picking + highlight ------------------------------------
+
+const EDGE_PICK_PX = 10;
+const EDGE_HOVER_MATERIAL = new THREE.LineBasicMaterial({ color: 0x4a7dfc });
+const EDGE_SELECTED_MATERIAL = new THREE.LineBasicMaterial({ color: 0xffcc55 });
+
+function projectToScreen(x, y, z, rect) {
+  const p = new THREE.Vector3(x, y, z).project(viewerCamera);
+  return { x: (p.x * 0.5 + 0.5) * rect.width, y: (-p.y * 0.5 + 0.5) * rect.height };
+}
+
+// Finds the solid edge nearest the cursor for the 3D-edge tool. First raycasts
+// against the mesh to get a depth-correct visible surface point (so picking is
+// judged against whatever's actually in front, not occluded geometry the mouse
+// happens to line up with), then finds whichever real BREP edge on
+// `currentSolidForPicking` passes closest to that point in 3D. Finally confirms
+// the cursor is genuinely near that edge on screen (in pixels) - without this,
+// clicking the middle of a large flat face would always snap to whatever edge
+// happens to be nearest, however far away, instead of correctly missing.
+function pickEdgeForViewerEvent(evt) {
+  if (!currentSolidForPicking) return null;
+  const hit = raycastViewer(evt);
+  if (!hit) return null;
+  const edge = findNearestEdge(currentSolidForPicking, hit.point);
+  if (!edge) return null;
+  const samples = sampleEdgePoints(edge, edgeSampleCount(edge));
+  const rect = viewerRenderer.domElement.getBoundingClientRect();
+  const mx = evt.clientX - rect.left, my = evt.clientY - rect.top;
+  let bestPx = Infinity;
+  samples.forEach((p) => {
+    const sp = projectToScreen(p.x, p.y, p.z, rect);
+    bestPx = Math.min(bestPx, Math.hypot(sp.x - mx, sp.y - my));
+  });
+  if (bestPx > EDGE_PICK_PX) return null;
+  const mid = edge.pointAt(0.5);
+  return { edge, samples, point: { x: mid.x, y: mid.y, z: mid.z } };
+}
+
+function buildEdgeHighlightLine(samples, material) {
+  const points = samples.map(p => new THREE.Vector3(p.x, p.y, p.z));
+  const geometry = new THREE.BufferGeometry().setFromPoints(points);
+  return new THREE.Line(geometry, material);
+}
+
+function clearHoverEdgeHighlight() {
+  if (hoverEdgeHighlight) {
+    viewerScene.remove(hoverEdgeHighlight);
+    hoverEdgeHighlight.geometry.dispose();
+    hoverEdgeHighlight = null;
+  }
+}
+
+function clearSelectedEdgeHighlight() {
+  if (selectedEdgeHighlight) {
+    viewerScene.remove(selectedEdgeHighlight);
+    selectedEdgeHighlight.geometry.dispose();
+    selectedEdgeHighlight = null;
+  }
+}
+
 function onViewerPointerDown(evt) {
   viewerPointerDown = { x: evt.clientX, y: evt.clientY };
 }
@@ -3450,30 +3887,148 @@ function onViewerPointerUp(evt) {
   const moved = Math.hypot(evt.clientX - viewerPointerDown.x, evt.clientY - viewerPointerDown.y);
   viewerPointerDown = null;
   if (moved > 5) return; // an orbit drag, not a pick click
-  if (!faceSelectMode) return;
-  const hit = raycastViewer(evt);
-  if (!hit) return;
-  const result = getFaceRegionForHit(hit);
-  if (!result) return;
-  faceSelectMode = false;
-  clearHoverHighlight();
-  const adj = getOrBuildAdjacency(hit.object);
-  clearSelectedHighlight();
-  selectedFaceHighlight = new THREE.Mesh(buildHighlightGeometry(adj, result.triIndices, result.basis.normal), HIGHLIGHT_MATERIAL_SELECTED);
-  viewerScene.add(selectedFaceHighlight);
-  enterFaceEditMode(result);
+  if (faceSelectMode) {
+    const hit = raycastViewer(evt);
+    if (!hit) return;
+    const result = getFaceRegionForHit(hit);
+    if (!result) return;
+    faceSelectMode = false;
+    clearHoverHighlight();
+    const adj = getOrBuildAdjacency(hit.object);
+    clearSelectedHighlight();
+    selectedFaceHighlight = new THREE.Mesh(buildHighlightGeometry(adj, result.triIndices, result.basis.normal), HIGHLIGHT_MATERIAL_SELECTED);
+    viewerScene.add(selectedFaceHighlight);
+    enterFaceEditMode(result);
+    return;
+  }
+  if (currentTool === 'edge3d' && !faceEditContext && !baseRollback) {
+    if (edgeFilletEditor) { closeEdgeFilletEditor(true); return; } // clicking elsewhere applies the pending one first
+    const pick = pickEdgeForViewerEvent(evt);
+    if (!pick) return;
+    clearHoverEdgeHighlight();
+    clearSelectedEdgeHighlight();
+    selectedEdgeHighlight = buildEdgeHighlightLine(pick.samples, EDGE_SELECTED_MATERIAL);
+    viewerScene.add(selectedEdgeHighlight);
+    openEdgeFilletEditor(pick);
+  }
 }
 
 function onViewerPointerMove(evt) {
-  if (!faceSelectMode) return;
-  const hit = raycastViewer(evt);
-  if (!hit) { clearHoverHighlight(); return; }
-  const adj = getOrBuildAdjacency(hit.object);
-  const region = floodFillCoplanarRegion(adj, hit.faceIndex);
-  if (!region) { clearHoverHighlight(); return; }
-  clearHoverHighlight();
-  hoverFaceHighlight = new THREE.Mesh(buildHighlightGeometry(adj, region.triIndices, region.normal), HIGHLIGHT_MATERIAL_HOVER);
-  viewerScene.add(hoverFaceHighlight);
+  if (faceSelectMode) {
+    const hit = raycastViewer(evt);
+    if (!hit) { clearHoverHighlight(); return; }
+    const adj = getOrBuildAdjacency(hit.object);
+    const region = floodFillCoplanarRegion(adj, hit.faceIndex);
+    if (!region) { clearHoverHighlight(); return; }
+    clearHoverHighlight();
+    hoverFaceHighlight = new THREE.Mesh(buildHighlightGeometry(adj, region.triIndices, region.normal), HIGHLIGHT_MATERIAL_HOVER);
+    viewerScene.add(hoverFaceHighlight);
+    return;
+  }
+  if (currentTool === 'edge3d' && !faceEditContext && !baseRollback && !edgeFilletEditor) {
+    const pick = pickEdgeForViewerEvent(evt);
+    if (!pick) { clearHoverEdgeHighlight(); viewerRenderer.domElement.style.cursor = 'auto'; return; }
+    clearHoverEdgeHighlight();
+    hoverEdgeHighlight = buildEdgeHighlightLine(pick.samples, EDGE_HOVER_MATERIAL);
+    viewerScene.add(hoverEdgeHighlight);
+    viewerRenderer.domElement.style.cursor = 'pointer';
+  }
+}
+
+// Floating radius-input popup for a just-picked 3D edge, styled and wired the
+// same way as the 2D corner-fillet editor (openFilletEditor) - Enter/blur
+// applies, Escape cancels. Positioned over the 3D viewer at the edge's own
+// midpoint (projected to screen), appended to #view-pane (not #viewer) since
+// that's the nearest positioned ancestor - see .pane in style.css - matching
+// how #face-select-hint is positioned there too.
+function openEdgeFilletEditor(pick) {
+  closeEdgeFilletEditor(false);
+  const rect = viewerRenderer.domElement.getBoundingClientRect();
+  const screenPos = projectToScreen(pick.point.x, pick.point.y, pick.point.z, rect);
+  const canvasEl = viewerRenderer.domElement;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'dim-editor-wrap';
+  wrap.style.left = (canvasEl.offsetLeft + screenPos.x) + 'px';
+  wrap.style.top = (canvasEl.offsetTop + screenPos.y) + 'px';
+
+  const label = document.createElement('span');
+  label.className = 'dim-anchor-btn';
+  label.style.cursor = 'default';
+  label.title = 'Rundungsradius (Fillet) für diese 3D-Kante';
+  label.textContent = '⌒';
+  wrap.appendChild(label);
+
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.className = 'dim-editor';
+  input.step = '0.1';
+  input.min = '0.1';
+  input.placeholder = '2';
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') closeEdgeFilletEditor(true);
+    else if (e.key === 'Escape') closeEdgeFilletEditor(false);
+  });
+  input.addEventListener('blur', () => closeEdgeFilletEditor(true));
+  wrap.appendChild(input);
+
+  document.getElementById('view-pane').appendChild(wrap);
+  edgeFilletEditor = { input, wrap, point: pick.point };
+  input.focus();
+}
+
+function closeEdgeFilletEditor(apply) {
+  if (!edgeFilletEditor) return;
+  const { input, wrap, point } = edgeFilletEditor;
+  edgeFilletEditor = null; // clear first so the blur triggered by remove() below doesn't recurse
+  if (apply) {
+    const val = parseFloat(input.value);
+    if (!isNaN(val) && val > 0) {
+      edgeFillets.push({ id: nextEdgeFilletId++, point, radius: val });
+      onEdgeFilletsChanged();
+    }
+  }
+  wrap.remove();
+  clearSelectedEdgeHighlight();
+}
+
+function onEdgeFilletsChanged() {
+  markProjectDirty();
+  renderEdgeFilletList();
+  rebuildSolid();
+}
+
+function deleteEdgeFillet(id) {
+  edgeFillets = edgeFillets.filter(f => f.id !== id);
+  onEdgeFilletsChanged();
+}
+
+function renderEdgeFilletList() {
+  const panel = document.getElementById('edge-fillet-panel-block');
+  const list = document.getElementById('edge-fillet-list');
+  if (!panel || !list) return;
+  panel.style.display = edgeFillets.length ? 'block' : 'none';
+  list.innerHTML = '';
+  edgeFillets.forEach((f, idx) => {
+    const item = document.createElement('div');
+    item.className = 'shape-item';
+
+    const row = document.createElement('div');
+    row.className = 'shape-item-row';
+    const label = document.createElement('span');
+    label.textContent = `${idx + 1}. Kante R${f.radius} mm`;
+    row.appendChild(label);
+
+    const delBtn = document.createElement('button');
+    delBtn.textContent = '✕';
+    delBtn.title = 'Kantenrundung entfernen';
+    delBtn.addEventListener('click', () => deleteEdgeFillet(f.id));
+    row.appendChild(delBtn);
+
+    item.appendChild(row);
+    list.appendChild(item);
+  });
 }
 
 // ---- face-edit mode: state, UI wiring ---------------------------------------
@@ -3564,6 +4119,7 @@ function exitFaceEditMode(commit) {
   closeLengthEditor(false);
   closePointEditor(false);
   closeFilletEditor(false);
+  closePivotEditor(false);
   endDrag();
   endBgImageDrag();
   selectedShapeIds.clear();
@@ -3803,6 +4359,7 @@ function serializeProject() {
     version: PROJECT_FILE_VERSION,
     nextShapeId,
     nextFeatureId,
+    nextEdgeFilletId,
     shapes,
     backgroundImages: backgroundImages.map(bg => ({ id: bg.id, dataUrl: bg.dataUrl, x1: bg.x1, y1: bg.y1, x2: bg.x2, y2: bg.y2 })),
     faceFeatures: faceFeatures.map(f => ({
@@ -3818,6 +4375,7 @@ function serializeProject() {
       shapes: f.shapes,
       backgroundImages: (f.backgroundImages || []).map(bg => ({ id: bg.id, dataUrl: bg.dataUrl, x1: bg.x1, y1: bg.y1, x2: bg.x2, y2: bg.y2 })),
     })),
+    edgeFillets: edgeFillets.map(f => ({ id: f.id, point: f.point, radius: f.radius })),
   };
 }
 
@@ -3886,6 +4444,8 @@ function loadProject(data) {
   closeLengthEditor(false);
   closePointEditor(false);
   closeFilletEditor(false);
+  closePivotEditor(false);
+  closeEdgeFilletEditor(false);
   endDrag();
   endBgImageDrag();
   faceSelectMode = false;
@@ -3896,6 +4456,8 @@ function loadProject(data) {
   panState = null;
   clearHoverHighlight();
   clearSelectedHighlight();
+  clearHoverEdgeHighlight();
+  clearSelectedEdgeHighlight();
 
   shapes = data.shapes;
   history = [];
@@ -3928,16 +4490,21 @@ function loadProject(data) {
     backgroundImages: hydrateBackgroundImages(f.backgroundImages),
   }));
 
+  edgeFillets = (data.edgeFillets || []).map(f => ({ id: f.id, point: f.point, radius: f.radius }));
+
   const maxShapeId = shapes.reduce((m, s) => Math.max(m, s.id || 0), 0);
   const maxFeatureId = faceFeatures.reduce((m, f) => Math.max(m, f.id || 0), 0);
+  const maxEdgeFilletId = edgeFillets.reduce((m, f) => Math.max(m, f.id || 0), 0);
   nextShapeId = data.nextShapeId || (maxShapeId + 1);
   nextFeatureId = data.nextFeatureId || (maxFeatureId + 1);
+  nextEdgeFilletId = data.nextEdgeFilletId || (maxEdgeFilletId + 1);
   const allBgIds = backgroundImages.map(b => b.id).concat(faceFeatures.flatMap(f => f.backgroundImages.map(b => b.id)));
   nextBgImageId = allBgIds.length ? Math.max(...allBgIds) + 1 : 1;
 
   projectDirty = false;
   markDirty();
   renderShapeList();
+  renderEdgeFilletList();
   renderHistoryTree();
   rebuildSolid();
   render();
