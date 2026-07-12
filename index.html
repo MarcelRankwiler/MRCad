@@ -104,10 +104,10 @@
       <div class="pane-title" id="sketch-pane-title">2D Skizze (Klicken zum Zeichnen)</div>
       <canvas id="sketch-canvas"></canvas>
       <div id="face-edit-controls" style="display:none">
-        <span id="face-edit-label">Formen auf dieser Fläche: „Aufaddieren“ = Erhebung, „Loch“ = Ausschnitt (echtes Boolean-Schneiden). Mit „⬆ Extrudieren“ übernehmen.</span>
+        <span id="face-edit-label">Formen auf dieser Fläche: „Aufaddieren“ = Erhebung, „Loch“ = Ausschnitt (echtes Boolean-Schneiden). Die 3D-Vorschau aktualisiert sich live - mit „✓ Übernehmen“ bestätigen.</span>
         <button id="btn-cancel-face-edit">✕ Abbrechen</button>
       </div>
-      <div id="sketch-hint">Linien-Tool: Punkte anklicken, mit Doppelklick oder Enter schließen. Alt+Klick auf eine bestehende Linie: als Referenzlinie übernehmen (nächstes Segment richtet sich an deren Winkel aus). Strg gedrückt halten: aktuellen Winkel fixieren, Länge kann an anderen Linien einschnappen oder sich mit einem beliebigen anderen Punkt (z.B. dem Startpunkt) auf gleiche Höhe/Breite ausrichten, unabhängig vom Snap-Raster. Umschalt (Shift) beim Setzen des Endpunkts gedrückt halten: biegt das gerade gesetzte Segment zu einem Bogen, Stärke/Richtung folgt der Maus - loslassen übernimmt die Biegung, weiter normal klicken (ohne Shift) für gerade Segmente (beliebig mischbar). Nachträglich lässt sich ein bereits gesetztes Segment so nicht mehr biegen. Kreis-Tool: Klick = Mittelpunkt, dann ziehen und klicken = Radius. Rechteck-Tool: Klick = erste Ecke, Klick = gegenüberliegende Ecke. Vieleck-Tools (3/5/6/8-Eck): Klick = Mittelpunkt, dann ziehen und klicken = Radius und Ausrichtung. Text-Tool: rechts Einstellungen wählen, dann klicken = linker Rand der Grundlinie. Lochkreis-Tool: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken - wechselt danach automatisch ins Punkte-Tool zur Feinjustierung. Vor dem Extrudieren für jede Form im Formen-Optionsmenü „Loch“ oder „Aufaddieren“ sowie die eigene Höhe/Tiefe wählen. Auswahl-Tool: Strg+Klick fügt eine Form der Auswahl hinzu/entfernt sie, mehrere ausgewählte Formen lassen sich gemeinsam verschieben. Punkte-Tool: Eckpunkt oder Mittelpunkt anklicken, um die Koordinaten zu bearbeiten, oder anklicken und ziehen, um ihn direkt zu verschieben (rastet auf dem Snap-Raster ein). Linien-Tool (⌒): Linie einer Linienform nahe einer Ecke anklicken, um dort einen Rundungsradius einzugeben (0 oder leer = scharfe Ecke). Mausrad: Zoom. Mittlere Maustaste ziehen: Ansicht verschieben.</div>
+      <div id="sketch-hint">Linien-Tool: Punkte anklicken, mit Doppelklick oder Enter schließen. Alt+Klick auf eine bestehende Linie: als Referenzlinie übernehmen (nächstes Segment richtet sich an deren Winkel aus). Strg gedrückt halten: aktuellen Winkel fixieren, Länge kann an anderen Linien einschnappen oder sich mit einem beliebigen anderen Punkt (z.B. dem Startpunkt) auf gleiche Höhe/Breite ausrichten, unabhängig vom Snap-Raster. Umschalt (Shift) beim Setzen des Endpunkts gedrückt halten: biegt das gerade gesetzte Segment zu einem Bogen, Stärke/Richtung folgt der Maus - loslassen übernimmt die Biegung, weiter normal klicken (ohne Shift) für gerade Segmente (beliebig mischbar). Nachträglich lässt sich ein bereits gesetztes Segment so nicht mehr biegen. Kreis-Tool: Klick = Mittelpunkt, dann ziehen und klicken = Radius. Rechteck-Tool: Klick = erste Ecke, Klick = gegenüberliegende Ecke. Vieleck-Tools (3/5/6/8-Eck): Klick = Mittelpunkt, dann ziehen und klicken = Radius und Ausrichtung. Text-Tool: rechts Einstellungen wählen, dann klicken = linker Rand der Grundlinie. Lochkreis-Tool: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken - wechselt danach automatisch ins Punkte-Tool zur Feinjustierung. Vor dem Übernehmen für jede Form im Formen-Optionsmenü „Loch“ oder „Aufaddieren“ sowie die eigene Höhe/Tiefe wählen. Auswahl-Tool: Strg+Klick fügt eine Form der Auswahl hinzu/entfernt sie, mehrere ausgewählte Formen lassen sich gemeinsam verschieben. Punkte-Tool: Eckpunkt oder Mittelpunkt anklicken, um die Koordinaten zu bearbeiten, oder anklicken und ziehen, um ihn direkt zu verschieben (rastet auf dem Snap-Raster ein). Linien-Tool (⌒): Linie einer Linienform nahe einer Ecke anklicken, um dort einen Rundungsradius einzugeben (0 oder leer = scharfe Ecke). Mausrad: Zoom. Mittlere Maustaste ziehen: Ansicht verschieben.</div>
     </div>
 
     <div id="side-panel">
@@ -163,13 +163,37 @@
       </div>
       <div class="panel-block" id="extrude-panel-block">
         <h3>Extrusion</h3>
-        <div style="font-size:12px; color:#999; margin-bottom:8px;">Höhe/Tiefe wird pro Form in der Formen-Liste oben eingestellt (Aufaddieren/Loch).</div>
-        <button id="btn-extrude" class="primary">⬆ Extrudieren</button>
+        <div style="font-size:12px; color:#999; margin-bottom:8px;">Höhe/Tiefe wird pro Form in der Formen-Liste oben eingestellt (Aufaddieren/Loch) - die 3D-Vorschau aktualisiert sich automatisch bei jeder Änderung.</div>
+        <button id="btn-extrude" class="primary" title="Die 3D-Vorschau ist bereits aktuell - bestätigt die Änderung endgültig (zentriert die Ansicht, aktiviert den Export und übernimmt eine Flächen-Skizze in den Verlauf)">✓ Übernehmen</button>
         <div id="extrude-status"></div>
       </div>
       <div class="panel-block">
         <h3>Flächenbearbeitung</h3>
-        <button id="btn-edit-face" disabled title="Erst extrudieren, dann eine Fläche des 3D-Modells anklicken, um dort weitere Formen hinzuzufügen oder auszuschneiden">🔲 Neue Skizze auf Fläche</button>
+        <button id="btn-edit-face" disabled title="Erst „Übernehmen“ klicken, dann eine Fläche des 3D-Modells anklicken, um dort weitere Formen hinzuzufügen oder auszuschneiden">🔲 Neue Skizze auf Fläche</button>
+        <button id="btn-new-plane" disabled title="Erst „Übernehmen“ klicken. Danach eine frei positionierte Ebene über Achse, Winkel und Koordinate definieren und darauf skizzieren - wird live mit dem bestehenden Modell verschnitten (Aufaddieren/Loch), mit „Übernehmen“ bestätigen" style="margin-top:6px">🧭 Neue Ebene</button>
+      </div>
+      <div class="panel-block" id="new-plane-panel-block" style="display:none">
+        <h3>Neue Ebene</h3>
+        <label>Achse (Ebenen-Normale)
+          <div class="button-row">
+            <button type="button" id="plane-axis-x" class="side-btn" data-axis="x">X</button>
+            <button type="button" id="plane-axis-y" class="side-btn" data-axis="y">Y</button>
+            <button type="button" id="plane-axis-z" class="side-btn active" data-axis="z">Z</button>
+          </div>
+        </label>
+        <label title="Versatz der Ebene entlang der gewählten Achse, ausgehend vom Ursprung (0,0,0)">Koordinate (mm)
+          <input type="number" id="plane-offset" value="0" step="1">
+        </label>
+        <label title="Kippt die Ebene um die feste Referenzachse in der Ebene selbst (bei Z-Normale um X, bei X-Normale um Y, bei Y-Normale um Z), durch den oben gewählten Koordinatenpunkt">Winkel (°)
+          <input type="number" id="plane-angle" value="0" step="1">
+        </label>
+        <label title="Die Normale zeigt immer in die positive Achsenrichtung, auch bei negativer Koordinate - liegt die Ebene z.B. auf der 'Rückseite' eines Bauteils, zeigt sie sonst ins Material hinein statt davon weg, wodurch 'Loch' kaum noch etwas trifft. Mit dieser Option umdrehen.">
+          <input type="checkbox" id="plane-flip"> Richtung umkehren
+        </label>
+        <div style="display:flex; gap:6px; margin-top:4px;">
+          <button type="button" id="btn-create-plane" class="primary" style="width:auto; flex:1; margin-top:0;">✓ Ebene erstellen</button>
+          <button type="button" id="btn-cancel-plane" style="flex:1;">✕ Abbrechen</button>
+        </div>
       </div>
       <div class="panel-block">
         <h3>Export</h3>

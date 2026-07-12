@@ -6,9 +6,9 @@
 // ---------------------------------------------------------------------------
 
 // ---- state ----------------------------------------------------------------
-let shapes = [];          // {id, type:'polygon'|'circle', points:[{x,y}]|null, center, radius, closed, isHole, isAdditive, additiveHeight, additiveSide:'top'|'bottom', holeDepth}
-                           // every shape is either isAdditive (grows from the sketch plane Z=0 by its own additiveHeight, toward +Z ('top') or -Z ('bottom'))
-                           // or isHole (cuts from Z=0 by its own holeDepth, same 'top'/'bottom' meaning via additiveSide) - see buildBaseGroup()
+let shapes = [];          // {id, type:'polygon'|'circle', points:[{x,y}]|null, center, radius, closed, isHole, isAdditive, additiveHeight, additiveSide:'top'|'bottom'|'center', holeDepth}
+                           // every shape is either isAdditive (grows from the sketch plane Z=0 by its own additiveHeight, toward +Z ('top'), -Z ('bottom'), or split evenly both ways ('center'))
+                           // or isHole (cuts from Z=0 by its own holeDepth, same 'top'/'bottom'/'center' meaning via additiveSide) - see buildBaseGroup()
                            // text-tool pieces are plain `polygon` shapes too (kind:'text', char - see textToShapePieces)
                            // multi-piece placements (text, hole-circle patterns) share a `groupId` so they select/drag/edit together
                            // polygon shapes may also have filletRadii: {vertexIndex: radiusMm} - rounded corners - and/or
@@ -26,6 +26,15 @@ let mousePos = null;      // current mouse position (canvas space), for previews
 let selectedShapeIds = new Set(); // Ctrl/Cmd-click adds/removes a shape in the 'select' tool, for multi-drag/multi-edit
 let errorShapeId = null;  // shape blamed for the most recent failed extrude (see buildBaseGroup/rebuildSolid) - drawn in red until the next extrude attempt
 let extrudedGroup = null; // THREE.Group currently in the viewer, exportable
+// True once the current sketch state has been explicitly confirmed via
+// "Übernehmen" (rebuildSolid succeeding) - as opposed to merely reflected in
+// the always-on live preview (see runLivePreview), which keeps `extrudedGroup`
+// up to date but does NOT set this. Gates "Neue Skizze auf Fläche"/"Neue
+// Ebene" (see updateFaceEditUI): starting a face/plane feature is deliberately
+// only allowed against a model the user has actively confirmed, not one
+// that's merely being live-previewed mid-edit. Reset to false by markDirty()
+// on every sketch change.
+let modelCommitted = false;
 let dimEditor = null;     // active length/radius <input> overlay, if any
 let pointEditor = null;   // active point-mode X/Y <input> overlay, if any
 let filletEditor = null;  // active corner-radius <input> overlay, if any (see filletCornerArc)
@@ -53,21 +62,36 @@ let angleLockAlignFrom = null; // world point the current snap hit is axis-align
 
 // ---- face-editing state -----------------------------------------------------
 // faceFeatures: ordered list of applied face-sketch features (boss/pocket geometry
-// sketched on a picked planar face of the extruded solid), each:
+// sketched on a picked planar face of the extruded solid, or on a free-standing
+// datum plane - see computeCustomPlaneBasis), each:
 // {id, basis:{origin,normal,uAxis,vAxis} (THREE.Vector3, "centered model space"),
-//  boundaryLoopUV:[{x,y}], innerLoopsUV:[[{x,y}]], shapes:[...], backgroundImages:[...]}
+//  boundaryLoopUV:[{x,y}], innerLoopsUV:[[{x,y}]], modelReferenceUV:[[{x,y}],...]
+//  (datum-plane features only - the rest of the model's edges projected onto this
+//  plane at creation time, shown as a sketch reference, see projectSolidEdgesToUV),
+//  shapes:[...], backgroundImages:[...]}
 let faceFeatures = [];
 let nextFeatureId = 1;
 let faceSelectMode = false;  // waiting for a click on the 3D model to pick a face
 // while sketching a face feature: {featureId|null (null = new), basis, boundaryLoopUV,
-// innerLoopsUV, baseShapes, baseHistory} - baseShapes/baseHistory are the stashed base
-// sketch's `shapes`/`history`, restored on exit
+// innerLoopsUV, modelReferenceUV, baseShapes, baseHistory} - baseShapes/baseHistory are
+// the stashed base sketch's `shapes`/`history`, restored on exit
 let faceEditContext = null;
-let baseRollback = false; // true while the history tree is temporarily rolled back to the base sketch (extrudedGroup cleared, "Extrudieren" pending)
+let baseRollback = false; // true while the history tree is temporarily rolled back to the base sketch (3D preview shows base only, "Übernehmen" pending - see runLivePreview)
 let meshVersion = 0;         // bumped whenever extrudedGroup is rebuilt; invalidates faceAdjacencyCache
 let faceAdjacencyCache = null; // {version, byObject: Map(mesh -> adjacency)}
 let hoverFaceHighlight = null;    // THREE.Mesh overlay for the currently hovered pickable face
 let selectedFaceHighlight = null; // THREE.Mesh overlay for the face currently being sketched on
+
+// ---- free-standing "new plane" (datum plane) state ---------------------------
+// A datum plane isn't tied to any picked face of the mesh - its basis is
+// computed from an axis/offset/angle triple instead (see computeCustomPlaneBasis).
+// Once created it becomes a regular faceFeature (enterFaceEditMode/exitFaceEditMode
+// with featureId:null), so it gets the exact same history entry, sketch/extrude
+// flow, and real boolean fuse/cut against the existing solid as any other
+// face-sketch feature - no separate code path needed for that part.
+let newPlaneMode = false;    // true while the "Neue Ebene" config panel is open (before commit)
+let newPlaneConfig = { axis: 'z', offset: 0, angle: 0, flip: false };
+let newPlanePreviewGroup = null; // THREE.Group overlay showing where the plane would land
 
 // ---- 3D edge fillets ---------------------------------------------------------
 // edgeFillets: ordered list of real BREP fillets applied to the finished solid
@@ -140,7 +164,7 @@ const btnInsertBgImage = document.getElementById('btn-insert-bg-image');
 const bgImageInput = document.getElementById('bg-image-input');
 
 // BREP kernel (OpenCascade via replicad, see js/oc-init.js) loads
-// asynchronously - keep "Extrudieren" disabled with a status message until
+// asynchronously - keep "Übernehmen" disabled with a status message until
 // it's ready, instead of letting the first click silently fail inside
 // buildBaseGroup()/replicad's getOC().
 btnExtrude.disabled = true;
@@ -966,21 +990,38 @@ function drawShape(shape, selected, isError) {
 // reference underlay while sketching a face feature, so the user can see the
 // face's boundary (and any pre-existing inner holes in it) while drawing.
 function drawFaceReferenceOutline() {
-  const drawLoop = (loop) => {
+  const drawLine = (loop, close) => {
     if (!loop || loop.length < 2) return;
     ctx.beginPath();
     ctx.moveTo(loop[0].x, loop[0].y);
     for (let i = 1; i < loop.length; i++) ctx.lineTo(loop[i].x, loop[i].y);
-    ctx.closePath();
+    if (close) ctx.closePath();
     ctx.stroke();
   };
   ctx.save();
   ctx.strokeStyle = '#777';
   ctx.setLineDash([4 / viewScale, 3 / viewScale]);
   ctx.lineWidth = 1.5 / viewScale;
-  drawLoop(faceEditContext.boundaryLoopUV);
-  (faceEditContext.innerLoopsUV || []).forEach(drawLoop);
+  drawLine(faceEditContext.boundaryLoopUV, true);
+  (faceEditContext.innerLoopsUV || []).forEach((l) => drawLine(l, true));
   ctx.restore();
+
+  // Free-standing datum-plane features (see computeCustomPlaneBasis) have no
+  // picked face of their own to outline above, so instead show the whole
+  // existing model's edges projected onto this plane - a flattened "footprint"
+  // reference so the user can see where the model sits while sketching on a
+  // plane that may not touch it at all. Frozen at the moment the plane was
+  // created (see projectSolidEdgesToUV / btnCreatePlane), same "fixed
+  // position" convention as boundaryLoopUV.
+  const refEdges = faceEditContext.modelReferenceUV;
+  if (refEdges && refEdges.length) {
+    ctx.save();
+    ctx.strokeStyle = '#4a7dfc';
+    ctx.setLineDash([3 / viewScale, 3 / viewScale]);
+    ctx.lineWidth = 1 / viewScale;
+    refEdges.forEach((l) => drawLine(l, false));
+    ctx.restore();
+  }
 }
 
 function drawDimensionLabels() {
@@ -1196,10 +1237,24 @@ function cancelInProgress() {
   angleLockAlignFrom = null;
 }
 
+// The additiveSide ('top'/'bottom'/'center') a freshly drawn shape should
+// start with. Every shape-creation site used to hardcode 'top' regardless of
+// isHole/isAdditive - but "top"/"bottom"/"center" mean the same "grows/cuts
+// from the sketch plane toward +normal/-normal/both ways" for either (see
+// replicadSidedSolid / applyFaceFeaturesSubset), so a hole drawn after an
+// object built as "Unten" was always starting out on the wrong side of that
+// object, needing to be flipped by hand every single time. Instead, inherit
+// whatever side the most recently added shape in the current sketch (base or
+// face/plane feature - `shapes` is whichever is currently active) is using,
+// falling back to 'top' only for the very first shape.
+function defaultAdditiveSide() {
+  return shapes.length ? shapes[shapes.length - 1].additiveSide : 'top';
+}
+
 function finishPolygon() {
   if (drawingPoints.length >= 3) {
     pushHistory();
-    const shape = { id: nextShapeId++, type: 'polygon', points: drawingPoints.slice(), isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: 'top', holeDepth: 5 };
+    const shape = { id: nextShapeId++, type: 'polygon', points: drawingPoints.slice(), isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: defaultAdditiveSide(), holeDepth: 5 };
     if (Object.keys(drawingBulges).length > 0) shape.curveBulges = { ...drawingBulges };
     shapes.push(shape);
     onShapesChanged();
@@ -1238,23 +1293,24 @@ function commitCurveBulge() {
   }
 }
 
+// Marks the current 3D preview as stale mid-edit (e.g. every mousemove of an
+// active shape/point drag, see updateDrag/updatePointDrag) - deliberately
+// does NOT touch `extrudedGroup`/the viewer scene itself, so the last-good
+// mesh stays on screen (a moment out of date) instead of flashing blank,
+// right up until scheduleLivePreview()'s debounced rebuild replaces it -
+// called separately, once, from onShapesChanged() when the edit completes.
 function markDirty() {
   btnExport.disabled = true;
   extrudeStatusEl.textContent = '';
-  if (extrudedGroup) {
-    viewerScene.remove(extrudedGroup);
-    extrudedGroup = null;
-  }
   currentSolidForPicking = null;
+  modelCommitted = false;
   updateFaceEditUI();
 }
 
 function onShapesChanged() {
   renderShapeList();
-  // While sketching a face feature, the base solid already on screen is still
-  // valid (nothing about it changed) - only invalidate/clear it for edits to
-  // the base sketch itself.
-  if (!faceEditContext) markDirty();
+  markDirty();
+  scheduleLivePreview();
 }
 
 canvas.addEventListener('mousemove', (evt) => {
@@ -1670,7 +1726,7 @@ canvas.addEventListener('click', (evt) => {
       const r = dist(circleCenter, p);
       if (r > 0) {
         pushHistory();
-        shapes.push({ id: nextShapeId++, type: 'circle', center: circleCenter, radius: r, isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: 'top', holeDepth: 5 });
+        shapes.push({ id: nextShapeId++, type: 'circle', center: circleCenter, radius: r, isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: defaultAdditiveSide(), holeDepth: 5 });
         onShapesChanged();
       }
       circleCenter = null;
@@ -1683,7 +1739,7 @@ canvas.addEventListener('click', (evt) => {
     } else {
       if (p.x !== shapeStartPoint.x || p.y !== shapeStartPoint.y) {
         pushHistory();
-        shapes.push({ id: nextShapeId++, type: 'polygon', kind: currentTool, points: shapeToolPoints(currentTool, shapeStartPoint, p), isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: 'top', holeDepth: 5 });
+        shapes.push({ id: nextShapeId++, type: 'polygon', kind: currentTool, points: shapeToolPoints(currentTool, shapeStartPoint, p), isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: defaultAdditiveSide(), holeDepth: 5 });
         onShapesChanged();
       }
       shapeStartPoint = null;
@@ -1720,6 +1776,7 @@ canvas.addEventListener('click', (evt) => {
     if (pieces.length > 0) {
       pushHistory();
       const groupId = nextShapeId;
+      const side = defaultAdditiveSide();
       pieces.forEach(center => {
         shapes.push({
           id: nextShapeId++,
@@ -1731,7 +1788,7 @@ canvas.addEventListener('click', (evt) => {
           isHole: false,
           isAdditive: true,
           additiveHeight: 5,
-          additiveSide: 'top',
+          additiveSide: side,
           holeDepth: 5,
         });
       });
@@ -2716,7 +2773,17 @@ function renderShapeList() {
       pushHistory();
       shapesInGroup(s).forEach(sh => {
         sh.isHole = holeCheckbox.checked;
-        if (sh.isHole) sh.isAdditive = false;
+        if (sh.isHole) {
+          sh.isAdditive = false;
+          // Carry the last-entered depth/height across the toggle - Höhe and
+          // Tiefe are stored separately per shape (so switching back and forth
+          // doesn't lose either value), but a value just typed while additive
+          // should still apply once switched to Loch, not silently fall back
+          // to whatever holeDepth happened to default to (5) - a hole that
+          // ends up far shallower than intended can look like "nothing
+          // happened" if it doesn't reach far enough into the material.
+          sh.holeDepth = sh.additiveHeight;
+        }
       });
       onShapesChanged();
     });
@@ -2734,7 +2801,10 @@ function renderShapeList() {
       pushHistory();
       shapesInGroup(s).forEach(sh => {
         sh.isAdditive = addCheckbox.checked;
-        if (sh.isAdditive) sh.isHole = false;
+        if (sh.isAdditive) {
+          sh.isHole = false;
+          sh.additiveHeight = sh.holeDepth; // see holeCheckbox's handler above
+        }
       });
       onShapesChanged();
     });
@@ -2787,25 +2857,42 @@ function renderShapeList() {
       unitLabel.textContent = 'mm';
       optRow.appendChild(unitLabel);
 
-      // "Oben"/"Unten" only means something for base-sketch additive shapes
-      // (stacked onto the base extrusion's Z top/bottom); a face-feature boss
-      // only ever grows outward along that face's own normal.
-      if (!faceEditContext) {
+      // "Oben"/"Unten"/"Mittig": for a base-sketch shape, which way it grows
+      // from the sketch plane (Z=0) - up, down, or split evenly both ways.
+      // For a face/plane-feature shape, the same choice applies relative to
+      // that feature's own basis normal instead of world Z (see
+      // applyFaceFeaturesSubset/extrudeFaceShape) - "Oben" (the default,
+      // matching every feature from before this option existed) grows outward
+      // along +normal, "Unten" reverses that (into -normal), "Mittig" splits
+      // evenly around the feature's own plane.
+      {
         const btnTop = document.createElement('button');
         btnTop.type = 'button';
         btnTop.textContent = 'Oben';
+        btnTop.title = faceEditContext ? 'Wächst entlang der Flächen-/Ebenen-Normale nach außen (Standard)' : '';
         btnTop.className = 'side-btn' + (s.additiveSide === 'top' ? ' active' : '');
 
         const btnBottom = document.createElement('button');
         btnBottom.type = 'button';
         btnBottom.textContent = 'Unten';
+        btnBottom.title = faceEditContext ? 'Wächst entgegen der Flächen-/Ebenen-Normale (nach innen)' : '';
         btnBottom.className = 'side-btn' + (s.additiveSide === 'bottom' ? ' active' : '');
+
+        const btnCenter = document.createElement('button');
+        btnCenter.type = 'button';
+        btnCenter.title = faceEditContext
+          ? 'Höhe wächst je zur Hälfte entlang und entgegen der Flächen-/Ebenen-Normale'
+          : 'Höhe wächst je zur Hälfte nach oben und unten aus der Skizzenebene heraus';
+        btnCenter.textContent = 'Mittig';
+        btnCenter.className = 'side-btn' + (s.additiveSide === 'center' ? ' active' : '');
 
         btnTop.addEventListener('click', () => { pushHistory(); shapesInGroup(s).forEach(sh => { sh.additiveSide = 'top'; }); onShapesChanged(); });
         btnBottom.addEventListener('click', () => { pushHistory(); shapesInGroup(s).forEach(sh => { sh.additiveSide = 'bottom'; }); onShapesChanged(); });
+        btnCenter.addEventListener('click', () => { pushHistory(); shapesInGroup(s).forEach(sh => { sh.additiveSide = 'center'; }); onShapesChanged(); });
 
         optRow.appendChild(btnTop);
         optRow.appendChild(btnBottom);
+        optRow.appendChild(btnCenter);
       }
       item.appendChild(optRow);
     }
@@ -2835,25 +2922,42 @@ function renderShapeList() {
       depthUnit.textContent = 'mm';
       depthRow.appendChild(depthUnit);
 
-      // "Oben"/"Unten" only means something for base-sketch holes (cut from
-      // the sketch plane Z=0 upward or downward); a face-feature pocket only
-      // ever cuts inward along that face's own normal.
-      if (!faceEditContext) {
+      // "Oben"/"Unten"/"Mittig": for a base-sketch hole, which way it cuts
+      // from the sketch plane (Z=0) - up, down, or symmetrically both ways.
+      // For a face/plane-feature pocket, the same choice applies relative to
+      // that feature's own basis normal instead of world Z (see
+      // applyFaceFeaturesSubset/extrudeFaceShape) - "Oben" (the default,
+      // matching every feature from before this option existed) cuts inward
+      // against +normal, "Unten" reverses that (outward, along +normal),
+      // "Mittig" splits evenly around the feature's own plane.
+      {
         const btnTop = document.createElement('button');
         btnTop.type = 'button';
         btnTop.textContent = 'Oben';
+        btnTop.title = faceEditContext ? 'Schneidet entgegen der Flächen-/Ebenen-Normale ins Material (Standard)' : '';
         btnTop.className = 'side-btn' + (s.additiveSide === 'top' ? ' active' : '');
 
         const btnBottom = document.createElement('button');
         btnBottom.type = 'button';
         btnBottom.textContent = 'Unten';
+        btnBottom.title = faceEditContext ? 'Schneidet entlang der Flächen-/Ebenen-Normale (nach außen)' : '';
         btnBottom.className = 'side-btn' + (s.additiveSide === 'bottom' ? ' active' : '');
+
+        const btnCenter = document.createElement('button');
+        btnCenter.type = 'button';
+        btnCenter.title = faceEditContext
+          ? 'Tiefe wächst je zur Hälfte entlang und entgegen der Flächen-/Ebenen-Normale'
+          : 'Tiefe wächst je zur Hälfte nach oben und unten aus der Skizzenebene heraus';
+        btnCenter.textContent = 'Mittig';
+        btnCenter.className = 'side-btn' + (s.additiveSide === 'center' ? ' active' : '');
 
         btnTop.addEventListener('click', () => { pushHistory(); shapesInGroup(s).forEach(sh => { sh.additiveSide = 'top'; }); onShapesChanged(); });
         btnBottom.addEventListener('click', () => { pushHistory(); shapesInGroup(s).forEach(sh => { sh.additiveSide = 'bottom'; }); onShapesChanged(); });
+        btnCenter.addEventListener('click', () => { pushHistory(); shapesInGroup(s).forEach(sh => { sh.additiveSide = 'center'; }); onShapesChanged(); });
 
         depthRow.appendChild(btnTop);
         depthRow.appendChild(btnBottom);
+        depthRow.appendChild(btnCenter);
       }
 
       item.appendChild(depthRow);
@@ -2948,6 +3052,8 @@ function doClearSketch() {
   faceSelectMode = false;
   faceEditContext = null;
   baseRollback = false;
+  newPlaneMode = false;
+  clearNewPlanePreview();
   selectedShapeIds.clear();
   selectedBgImageId = null;
   clearHoverHighlight();
@@ -3132,12 +3238,19 @@ function replicadShapeToMesh(solid, material) {
   return mesh;
 }
 
-// A prism-shaped Shape3D spanning [0, h] ('top') or [-h, 0] ('bottom') from
-// the sketch plane (Z=0), overshooting slightly past Z=0 so a fuse/cut
-// meeting exactly at the sketch plane isn't the classic ambiguous-coincident-
-// face case (FEATURE_OVERSHOOT, see below).
+// A prism-shaped Shape3D spanning [0, h] ('top'), [-h, 0] ('bottom'), or
+// [-h/2, h/2] ('center', symmetric around the sketch plane) - 'top'/'bottom'
+// overshoot slightly past Z=0 so a fuse/cut meeting exactly at the sketch
+// plane isn't the classic ambiguous-coincident-face case (FEATURE_OVERSHOOT,
+// see below); 'center' doesn't touch Z=0 with a face at all (it's the
+// midpoint of one continuous prism, not a seam between two pieces), so it
+// doesn't need that.
 function replicadSidedSolid(shape, h, side) {
   const drawing = shapeToDrawing(shape, true);
+  if (side === 'center') {
+    const sketch = drawing.sketchOnPlane('XY', -h / 2);
+    return sketch.extrude(h, { extrusionDirection: [0, 0, 1] });
+  }
   const zOffset = side === 'bottom' ? FEATURE_OVERSHOOT : -FEATURE_OVERSHOOT;
   const direction = side === 'bottom' ? [0, 0, -1] : [0, 0, 1];
   const sketch = drawing.sketchOnPlane('XY', zOffset);
@@ -3207,6 +3320,49 @@ function buildBaseGroup() {
   return { group, material, solid };
 }
 
+// Builds {group, solid, material, warnings} for a given base-sketch shape list
+// and face-feature list, purely computational (no viewer/DOM side effects) -
+// the shared core behind both the authoritative "Übernehmen" rebuild
+// (rebuildSolid) and the always-on live preview shown while editing (see
+// scheduleLivePreview). Temporarily swaps the module-level `shapes` to
+// `baseShapesSrc` for the duration of buildBaseGroup() (which reads it
+// directly), restoring it immediately after - synchronous, so this is safe
+// even while `shapes` currently points at a face feature's own sketch rather
+// than the base one. Returns null if there's nothing to build yet (no closed
+// additive shape in `baseShapesSrc`). Propagates buildBaseGroup()'s tagged
+// exception (failedShapeId) on a bad profile, same as before this refactor.
+function buildPreviewSolid(baseShapesSrc, featureList, includeFillets) {
+  const savedShapes = shapes;
+  shapes = baseShapesSrc;
+  let base;
+  try {
+    base = buildBaseGroup();
+  } finally {
+    shapes = savedShapes;
+  }
+  if (!base) return null;
+
+  const warnings = [];
+  let finalGroup, finalSolid;
+  if (featureList.length === 0) {
+    finalGroup = base.group;
+    finalSolid = base.solid;
+  } else {
+    const result = applyFaceFeaturesSubset(base.solid, base.material, featureList, warnings);
+    finalGroup = result.group;
+    finalSolid = result.solid;
+  }
+  // Edge fillets are always the very last step, applied on top of the base +
+  // face features (see edgeFillets above/applyEdgeFillets) - re-mesh only if
+  // there actually are any, no point re-triangulating an unfilletted solid.
+  if (includeFillets && edgeFillets.length > 0) {
+    finalSolid = applyEdgeFillets(finalSolid, edgeFillets, warnings);
+    finalGroup = new THREE.Group();
+    finalGroup.add(replicadShapeToMesh(finalSolid, base.material));
+  }
+  return { group: finalGroup, solid: finalSolid, material: base.material, warnings };
+}
+
 function frameCameraToGroup(group) {
   const fullBox = new THREE.Box3().setFromObject(group);
   const size = fullBox.getSize(new THREE.Vector3());
@@ -3221,10 +3377,14 @@ function frameCameraToGroup(group) {
 // Rebuilds the full solid from scratch: base sketch -> (if any face features
 // exist) BREP-fuse the base, then replay each face feature in creation order
 // (boolean fuse/cut its boss/pocket geometry, at its original fixed
-// position, into the running solid). Callable from the Extrudieren button
-// directly, or via exitFaceEditMode() when that same button commits a
-// face-edit sketch. Async because it awaits the WASM BREP kernel on first use.
+// position, into the running solid). This is the authoritative, "final" build -
+// it reframes the camera and unlocks export, unlike the always-on live preview
+// (see scheduleLivePreview) that keeps the viewer in sync while editing without
+// doing either. Callable from the Übernehmen button directly, or via
+// exitFaceEditMode() when that same button commits a face-edit sketch. Async
+// because it awaits the WASM BREP kernel on first use.
 async function rebuildSolid() {
+  cancelLivePreview(); // this supersedes any pending live-preview rebuild
   baseRollback = false;
   extrudeStatusEl.textContent = 'BREP-Kernel wird geladen…';
   btnExtrude.disabled = true;
@@ -3237,34 +3397,9 @@ async function rebuildSolid() {
   const hadErrorShape = errorShapeId != null;
   errorShapeId = null;
 
-  const warnings = [];
-  let base, finalGroup, finalSolid;
+  let result;
   try {
-    base = buildBaseGroup();
-    if (!base) {
-      if (hadErrorShape) render();
-      extrudeStatusEl.textContent = 'Keine geschlossene Form zum Extrudieren vorhanden.';
-      updateFaceEditUI();
-      return;
-    }
-    // The base group is already one fully BREP-fused solid (see buildBaseGroup);
-    // if face features exist, replay them on top of it.
-    if (faceFeatures.length === 0) {
-      finalGroup = base.group;
-      finalSolid = base.solid;
-    } else {
-      const result = applyFaceFeatures(base.solid, base.material, warnings);
-      finalGroup = result.group;
-      finalSolid = result.solid;
-    }
-    // Edge fillets are always the very last step, applied on top of the base +
-    // face features (see edgeFillets above/applyEdgeFillets) - re-mesh only if
-    // there actually are any, no point re-triangulating an unfilletted solid.
-    if (edgeFillets.length > 0) {
-      finalSolid = applyEdgeFillets(finalSolid, edgeFillets, warnings);
-      finalGroup = new THREE.Group();
-      finalGroup.add(replicadShapeToMesh(finalSolid, base.material));
-    }
+    result = buildPreviewSolid(shapes, faceFeatures, true);
   } catch (err) {
     // OpenCascade doesn't validate a sketch profile up front - a self-intersecting
     // outline (most often an over-bent curved line, see MAX_BULGE, or two shapes
@@ -3291,24 +3426,138 @@ async function rebuildSolid() {
     return;
   }
 
+  if (!result) {
+    if (hadErrorShape) render();
+    extrudeStatusEl.textContent = 'Keine geschlossene Form vorhanden.';
+    updateFaceEditUI();
+    return;
+  }
+
   if (extrudedGroup) {
     viewerScene.remove(extrudedGroup);
     extrudedGroup = null;
   }
 
-  viewerScene.add(finalGroup);
-  extrudedGroup = finalGroup;
-  currentSolidForPicking = finalSolid;
+  viewerScene.add(result.group);
+  extrudedGroup = result.group;
+  currentSolidForPicking = result.solid;
   meshVersion++;
   faceAdjacencyCache = null;
 
-  frameCameraToGroup(finalGroup);
+  frameCameraToGroup(result.group);
 
   if (hadErrorShape) render();
-  extrudeStatusEl.textContent = warnings.join(' ');
+  extrudeStatusEl.textContent = result.warnings.join(' ');
   btnExport.disabled = false;
+  modelCommitted = true;
   updateFaceEditUI();
   renderEdgeFilletList();
+}
+
+// ---- live 3D preview: keeps the viewer in sync with the sketch as changes
+// are made, without an explicit "Übernehmen" click - Übernehmen (rebuildSolid /
+// exitFaceEditMode) then only needs to lock the preview in (reframe the
+// camera, unlock export, and - for a face feature - commit it into
+// `faceFeatures` and leave edit mode). Debounced so a burst of edits (several
+// quick clicks, or the end of a drag) coalesces into one rebuild instead of
+// one per change; never called on every mousemove of an in-progress drag
+// itself (see updateDrag/updatePointDrag), only once the drag ends via
+// onShapesChanged() - continuous real-time preview during a drag would mean
+// one BREP boolean rebuild per animation frame, far too slow for OpenCascade.
+let livePreviewTimer = null;
+const LIVE_PREVIEW_DEBOUNCE_MS = 250;
+
+function cancelLivePreview() {
+  if (livePreviewTimer) {
+    clearTimeout(livePreviewTimer);
+    livePreviewTimer = null;
+  }
+}
+
+function scheduleLivePreview() {
+  cancelLivePreview();
+  livePreviewTimer = setTimeout(runLivePreview, LIVE_PREVIEW_DEBOUNCE_MS);
+}
+
+// Rebuilds and shows the 3D preview for whatever is currently being edited:
+// - normally (no face edit, no rollback): the full end-of-history model, base
+//   sketch + every committed face feature - same inputs as rebuildSolid, just
+//   without reframing the camera or touching baseRollback/export-lock state,
+//   so it can run continuously without being disruptive.
+// - rolled back to the base sketch (see goToTimelineEntry): base sketch ONLY,
+//   deliberately omitting face features - same reasoning as the old
+//   showRollbackPreview() this replaces: they depend on geometry that's
+//   currently being changed, so showing them would lie about the result.
+// - editing a face/plane feature (see enterFaceEditMode): the real base
+//   sketch (faceEditContext.baseShapes, NOT the module-level `shapes`, which
+//   right now IS the feature's own in-progress sketch) + every earlier
+//   committed feature + this one's live, not-yet-committed shapes.
+async function runLivePreview() {
+  livePreviewTimer = null;
+  await window.ocReadyPromise;
+  if (!viewerScene) initViewer();
+
+  const hadErrorShape = errorShapeId != null;
+  errorShapeId = null;
+
+  let baseShapesSrc, featureList, includeFillets;
+  if (faceEditContext) {
+    const idx = faceEditContext.featureId
+      ? faceFeatures.findIndex((f) => f.id === faceEditContext.featureId)
+      : faceFeatures.length;
+    baseShapesSrc = faceEditContext.baseShapes;
+    featureList = [...faceFeatures.slice(0, idx), { basis: faceEditContext.basis, shapes }];
+    includeFillets = true;
+  } else if (baseRollback) {
+    baseShapesSrc = shapes;
+    featureList = [];
+    includeFillets = false;
+  } else {
+    baseShapesSrc = shapes;
+    featureList = faceFeatures;
+    includeFillets = true;
+  }
+
+  let result;
+  try {
+    result = buildPreviewSolid(baseShapesSrc, featureList, includeFillets);
+  } catch (err) {
+    console.error('Live-Vorschau fehlgeschlagen:', err);
+    const idx2 = err.failedShapeId != null ? shapes.findIndex((s) => s.id === err.failedShapeId) : -1;
+    if (idx2 !== -1) {
+      errorShapeId = err.failedShapeId;
+      selectedShapeIds = new Set([err.failedShapeId]);
+      extrudeStatusEl.textContent = `Vorschau fehlgeschlagen bei Form ${idx2 + 1} (${shapeLabel(shapes[idx2])}, rot markiert in der Skizze) - vermutlich überschneidet sich ihre Kontur selbst (z.B. eine zu stark gebogene Linie).`;
+    } else {
+      extrudeStatusEl.textContent = 'Vorschau fehlgeschlagen - vermutlich überschneidet sich eine Kontur selbst (z.B. eine zu stark gebogene Linie).';
+    }
+    render();
+    renderShapeList();
+    updateFaceEditUI();
+    return;
+  }
+
+  if (!result) {
+    // Nothing valid to show yet (e.g. sketch has no closed additive shape) -
+    // leave whatever preview is already on screen alone rather than blanking
+    // it, same "don't discard the last good result" principle as rebuildSolid.
+    if (hadErrorShape) render();
+    extrudeStatusEl.textContent = 'Keine geschlossene Form vorhanden.';
+    updateFaceEditUI();
+    return;
+  }
+
+  if (extrudedGroup) viewerScene.remove(extrudedGroup);
+  viewerScene.add(result.group);
+  extrudedGroup = result.group;
+  currentSolidForPicking = result.solid;
+  meshVersion++;
+  faceAdjacencyCache = null;
+
+  if (hadErrorShape) render();
+  extrudeStatusEl.textContent = result.warnings.join(' ');
+  btnExport.disabled = false;
+  updateFaceEditUI();
 }
 
 btnExtrude.addEventListener('click', () => {
@@ -3368,6 +3617,90 @@ function buildFaceBasis(normal, origin) {
 function worldToUV(p, basis) {
   const rel = new THREE.Vector3().subVectors(p, basis.origin);
   return { x: rel.dot(basis.uAxis), y: rel.dot(basis.vAxis) };
+}
+
+// ---- free-standing "new plane" (datum plane) basis + preview ----------------
+
+const WORLD_AXES = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0), z: new THREE.Vector3(0, 0, 1) };
+const AXIS_ORDER = ['x', 'y', 'z'];
+
+// Builds a basis (same shape as buildFaceBasis's result) for a user-defined
+// datum plane: `axis` picks the un-tilted normal direction (one of the 3
+// standard planes - x -> YZ, y -> XZ, z -> XY), `offsetMm` places its origin
+// that far along that axis from the world origin, and `angleDeg` tilts the
+// plane by rotating around a fixed reference axis lying in the plane itself
+// (cyclic: x-normal tilts around y, y-normal around z, z-normal around x) -
+// so "Achse" first picks a base plane, then "Winkel" hinges it, both pivoting
+// through the same point set by "Koordinate".
+//
+// The normal always starts out pointing in the *positive* axis direction,
+// regardless of `offsetMm`'s sign - so a plane placed at e.g. Koordinate=-30
+// (the "far" side of a part centered on the origin) still gets a normal
+// pointing toward +axis, i.e. INTO the part rather than away from it. Since
+// "Aufaddieren"/"Loch" always add/cut along -overshoot..h / -d..+overshoot
+// relative to that normal (see extrudeFaceShape), a wrong-way normal there
+// means a boss grows into the part (usually still visible, just oddly placed)
+// while a hole cuts almost entirely into empty space beyond the part (only
+// the thin FEATURE_OVERSHOOT sliver actually touches it) - looking like
+// nothing happened. `flip` (the "Richtung umkehren" checkbox) negates the
+// normal (and vAxis, to stay a consistent right-handed frame - uAxis is the
+// tilt hinge and is unaffected either way) to fix that.
+function computeCustomPlaneBasis(axis, offsetMm, angleDeg, flip) {
+  const i = AXIS_ORDER.indexOf(axis);
+  const normal0 = WORLD_AXES[AXIS_ORDER[i]].clone();
+  const uAxis = WORLD_AXES[AXIS_ORDER[(i + 1) % 3]].clone();
+  const vAxis0 = new THREE.Vector3().crossVectors(normal0, uAxis).normalize();
+  const origin = normal0.clone().multiplyScalar(offsetMm || 0);
+  const angleRad = ((parseFloat(angleDeg) || 0) * Math.PI) / 180;
+  const normal = normal0.clone().applyAxisAngle(uAxis, angleRad).normalize();
+  const vAxis = vAxis0.applyAxisAngle(uAxis, angleRad).normalize();
+  if (flip) {
+    normal.negate();
+    vAxis.negate();
+  }
+  return { origin, normal, uAxis, vAxis };
+}
+
+const NEW_PLANE_PREVIEW_MATERIAL = new THREE.MeshBasicMaterial({ color: 0x5fd06b, transparent: true, opacity: 0.28, depthTest: true, side: THREE.DoubleSide });
+const NEW_PLANE_PREVIEW_EDGE_MATERIAL = new THREE.LineBasicMaterial({ color: 0x5fd06b });
+
+// Picks a reasonable preview plane size: big enough to visibly span the
+// current model, with a sane fallback before anything has been extruded yet.
+function newPlanePreviewSize() {
+  if (extrudedGroup) {
+    const diag = new THREE.Box3().setFromObject(extrudedGroup).getSize(new THREE.Vector3()).length();
+    if (diag > 1e-6) return Math.max(diag * 0.9, 60);
+  }
+  return 150;
+}
+
+// (Re)draws the translucent plane + normal arrow overlay in the 3D viewer for
+// the currently configured datum plane, so the user can see where it would
+// land before committing - called on every axis/offset/angle change.
+function updateNewPlanePreview() {
+  clearNewPlanePreview();
+  if (!newPlaneMode || !viewerScene) return;
+  const basis = computeCustomPlaneBasis(newPlaneConfig.axis, newPlaneConfig.offset, newPlaneConfig.angle, newPlaneConfig.flip);
+  const size = newPlanePreviewSize();
+  const group = new THREE.Group();
+
+  const geometry = new THREE.PlaneGeometry(size, size);
+  group.add(new THREE.Mesh(geometry, NEW_PLANE_PREVIEW_MATERIAL));
+  group.add(new THREE.LineSegments(new THREE.EdgesGeometry(geometry), NEW_PLANE_PREVIEW_EDGE_MATERIAL));
+  group.add(new THREE.ArrowHelper(basis.normal, new THREE.Vector3(0, 0, 0), size * 0.25, 0x5fd06b, size * 0.05, size * 0.03));
+
+  group.position.copy(basis.origin);
+  group.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(basis.uAxis, basis.vAxis, basis.normal));
+
+  viewerScene.add(group);
+  newPlanePreviewGroup = group;
+}
+
+function clearNewPlanePreview() {
+  if (!newPlanePreviewGroup) return;
+  if (viewerScene) viewerScene.remove(newPlanePreviewGroup);
+  newPlanePreviewGroup.traverse((obj) => { if (obj.geometry) obj.geometry.dispose(); });
+  newPlanePreviewGroup = null;
 }
 
 // ---- mesh adjacency + coplanar flood-fill + boundary tracing ----------------
@@ -3623,13 +3956,32 @@ function extrudeFaceShape(shape, basis, alongNormalFrom, alongNormalTo) {
 // avoiding on principle, so the overshoot stays.)
 const FEATURE_OVERSHOOT = 0.05; // mm
 
+// Computes [alongNormalFrom, alongNormalTo] (see extrudeFaceShape) for a
+// face/plane feature's boss ('isAdditive', amount = additiveHeight) or
+// pocket (amount = holeDepth), given its own `side` - the same
+// 'top'/'bottom'/'center' choice as a base-sketch shape's additiveSide, just
+// relative to the feature's own basis normal instead of world Z:
+// - 'top' (default, matches every feature saved before this option existed):
+//   a boss grows outward along +normal, a pocket cuts inward against it
+//   (along -normal) - unchanged from before.
+// - 'bottom': the reverse of 'top' along the same axis.
+// - 'center': split evenly both ways around the feature's own plane - like
+//   replicadSidedSolid's 'center', this doesn't need the overshoot since it
+//   isn't meeting the plane with a face, just passing through its middle.
+function faceFeatureExtrudeRange(amount, side, isAdditive) {
+  if (side === 'center') return [-amount / 2, amount / 2];
+  const reversed = side === 'bottom';
+  if (isAdditive) return reversed ? [-amount, FEATURE_OVERSHOOT] : [-FEATURE_OVERSHOOT, amount];
+  return reversed ? [-FEATURE_OVERSHOOT, amount] : [-amount, FEATURE_OVERSHOOT];
+}
+
 // Starting from `baseSolid` (the already-built base sketch, a replicad
 // Shape3D), replays each given face feature in creation order: extrude each
 // of its shapes (additive -> fuse boss, hole -> cut pocket) along the
 // feature's stored basis - the exact plane it was originally sketched on -
 // and fold it into the solid. `featureList` is a prefix of (or the full)
-// `faceFeatures`, so this also powers the temporary "rolled back" preview
-// shown while re-editing an earlier feature (see showRollbackPreview).
+// `faceFeatures`, so this also powers the live preview shown while a feature
+// is being (re-)edited (see runLivePreview).
 //
 // Deliberately does NOT try to re-locate the feature's face if the base (or
 // an earlier feature) has since changed shape: the boss/pocket stays fixed
@@ -3649,10 +4001,12 @@ function applyFaceFeaturesSubset(baseSolid, material, featureList, warnings) {
       try {
         if (s.isAdditive) {
           const h = Math.max(0.01, parseFloat(s.additiveHeight) || 5);
-          solid = solid.fuse(extrudeFaceShape(s, basis, -FEATURE_OVERSHOOT, h));
+          const [from, to] = faceFeatureExtrudeRange(h, s.additiveSide, true);
+          solid = solid.fuse(extrudeFaceShape(s, basis, from, to));
         } else {
           const d = Math.max(0.01, parseFloat(s.holeDepth) || 5);
-          solid = solid.cut(extrudeFaceShape(s, basis, -d, FEATURE_OVERSHOOT));
+          const [from, to] = faceFeatureExtrudeRange(d, s.additiveSide, false);
+          solid = solid.cut(extrudeFaceShape(s, basis, from, to));
         }
       } catch (err) {
         warnings.push(`Feature #${idx + 1} konnte nicht angewendet werden, übersprungen.`);
@@ -3689,6 +4043,18 @@ function edgeSampleCount(edge) {
   let len = 0;
   try { len = edge.length; } catch (err) { /* degenerate edge - fall through with len=0 */ }
   return Math.max(6, Math.min(48, Math.round(len / 2) + 6));
+}
+
+// Projects every real BREP edge of `solid` onto `basis` as an array of open UV
+// polylines - a flattened wireframe "footprint" of the model, used as a
+// sketch-plane reference for free-standing datum planes (see
+// computeCustomPlaneBasis / drawFaceReferenceOutline) that have no picked
+// face of their own to show a boundary for.
+function projectSolidEdgesToUV(solid, basis) {
+  if (!solid) return [];
+  let edges;
+  try { edges = solid.edges; } catch (err) { return []; }
+  return edges.map((edge) => sampleEdgePoints(edge, edgeSampleCount(edge)).map((p) => worldToUV(new THREE.Vector3(p.x, p.y, p.z), basis)));
 }
 
 // Finds whichever edge of `solid` passes closest to world-space `point` - used
@@ -3735,36 +4101,6 @@ function applyEdgeFillets(solid, filletList, warnings) {
     }
   });
   return solid;
-}
-
-// Shows a temporary preview of the solid as it existed right before a given
-// point in the timeline (base-only, or base + a prefix of faceFeatures),
-// while the user edits an earlier sketch - so the 3D view doesn't lie about
-// later features that depend on geometry currently being changed. Replaced
-// by a full rebuildSolid() once editing ends (both Extrudieren and Abbrechen),
-// which reapplies everything up to the end of the timeline again.
-async function showRollbackPreview(featureCount) {
-  if (extrudedGroup) {
-    viewerScene.remove(extrudedGroup);
-    extrudedGroup = null;
-  }
-  // Not a real end-of-timeline model (it deliberately omits edge fillets and any
-  // features past featureCount) - not meant for the 3D-edge tool to pick against.
-  currentSolidForPicking = null;
-  await window.ocReadyPromise;
-  const base = buildBaseGroup();
-  btnExport.disabled = true;
-  if (!base) {
-    extrudeStatusEl.textContent = 'Keine geschlossene Form zum Extrudieren vorhanden.';
-    return;
-  }
-  const warnings = [];
-  const group = featureCount === 0 ? base.group : applyFaceFeaturesSubset(base.solid, base.material, faceFeatures.slice(0, featureCount), warnings).group;
-  viewerScene.add(group);
-  extrudedGroup = group;
-  meshVersion++;
-  faceAdjacencyCache = null;
-  extrudeStatusEl.textContent = warnings.join(' ');
 }
 
 // ---- picking: raycast + hover/selection highlight ---------------------------
@@ -3901,7 +4237,7 @@ function onViewerPointerUp(evt) {
     enterFaceEditMode(result);
     return;
   }
-  if (currentTool === 'edge3d' && !faceEditContext && !baseRollback) {
+  if (currentTool === 'edge3d' && !faceEditContext && !baseRollback && !newPlaneMode) {
     if (edgeFilletEditor) { closeEdgeFilletEditor(true); return; } // clicking elsewhere applies the pending one first
     const pick = pickEdgeForViewerEvent(evt);
     if (!pick) return;
@@ -3925,7 +4261,7 @@ function onViewerPointerMove(evt) {
     viewerScene.add(hoverFaceHighlight);
     return;
   }
-  if (currentTool === 'edge3d' && !faceEditContext && !baseRollback && !edgeFilletEditor) {
+  if (currentTool === 'edge3d' && !faceEditContext && !baseRollback && !newPlaneMode && !edgeFilletEditor) {
     const pick = pickEdgeForViewerEvent(evt);
     if (!pick) { clearHoverEdgeHighlight(); viewerRenderer.domElement.style.cursor = 'auto'; return; }
     clearHoverEdgeHighlight();
@@ -4085,21 +4421,17 @@ function enterFaceEditMode(pick) {
     basis: pick.basis,
     boundaryLoopUV: pick.boundaryLoopUV,
     innerLoopsUV: pick.innerLoopsUV || [],
+    modelReferenceUV: pick.modelReferenceUV || [],
     baseShapes: shapes,
     baseHistory: history,
     baseBackgroundImages: backgroundImages,
   };
 
-  // Re-editing an existing feature: temporarily roll the 3D view back to how
-  // the model looked right before this feature was applied (base + every
-  // earlier feature, but not this one or any later one). Must run before
-  // `shapes` is swapped to the feature's own sketch below, since it rebuilds
-  // from the base sketch via the global `shapes`/buildBaseGroup().
-  if (existingIdx >= 0) showRollbackPreview(existingIdx);
-
   // Deep-clone so in-place edits (dragging a point, changing a length, adding
-  // a shape) don't leak into the stored feature until "Extrudieren" actually
-  // commits `shapes` back onto it - otherwise "Abbrechen" couldn't undo them.
+  // a shape) don't leak into the stored feature until "Übernehmen" actually
+  // commits `shapes` back onto it - otherwise "Abbrechen" couldn't undo them
+  // (the live preview shown in the meantime reads the live `shapes` directly,
+  // see runLivePreview, so it stays in sync without needing this clone touched).
   shapes = existing ? JSON.parse(JSON.stringify(existing.shapes)) : [];
   history = [];
   // Shallow-clone (not deep, unlike shapes above) since each entry carries a
@@ -4107,10 +4439,21 @@ function enterFaceEditMode(pick) {
   // "Abbrechen" only needs to discard position/size edits, not the image itself.
   backgroundImages = existing ? (existing.backgroundImages || []).map(bg => ({ ...bg })) : [];
 
-  fitViewToLoop(pick.boundaryLoopUV);
+  // A picked face fits to its own boundary; a free-standing datum plane has
+  // none (boundaryLoopUV is empty), so fit to the projected model reference
+  // wireframe instead - fitViewToLoop only reads point x/y, it doesn't care
+  // whether they form one closed loop or come from many separate edges.
+  const fitPoints = (pick.boundaryLoopUV && pick.boundaryLoopUV.length) ? pick.boundaryLoopUV : (pick.modelReferenceUV || []).flat();
+  fitViewToLoop(fitPoints);
   renderShapeList();
   updateFaceEditUI();
   render();
+
+  // Immediately show this feature's own state (base + earlier features + this
+  // one's - possibly pre-existing - shapes), rather than waiting for the
+  // debounce or the first edit (see runLivePreview).
+  cancelLivePreview();
+  runLivePreview();
 }
 
 function exitFaceEditMode(commit) {
@@ -4137,6 +4480,7 @@ function exitFaceEditMode(commit) {
         basis: ctx.basis,
         boundaryLoopUV: ctx.boundaryLoopUV,
         innerLoopsUV: ctx.innerLoopsUV,
+        modelReferenceUV: ctx.modelReferenceUV,
         shapes: shapes,
         backgroundImages: backgroundImages,
       });
@@ -4161,14 +4505,14 @@ function exitFaceEditMode(commit) {
 }
 
 function reopenFaceFeature(id) {
-  if (faceEditContext || faceSelectMode) return;
+  if (faceEditContext || faceSelectMode || newPlaneMode) return;
   const f = faceFeatures.find((x) => x.id === id);
   if (!f) return;
-  enterFaceEditMode({ featureId: f.id, basis: f.basis, boundaryLoopUV: f.boundaryLoopUV, innerLoopsUV: f.innerLoopsUV });
+  enterFaceEditMode({ featureId: f.id, basis: f.basis, boundaryLoopUV: f.boundaryLoopUV, innerLoopsUV: f.innerLoopsUV, modelReferenceUV: f.modelReferenceUV });
 }
 
 function deleteFaceFeature(id) {
-  if (faceEditContext || faceSelectMode) return;
+  if (faceEditContext || faceSelectMode || newPlaneMode) return;
   faceFeatures = faceFeatures.filter((f) => f.id !== id);
   markProjectDirty();
   rebuildSolid();
@@ -4203,23 +4547,21 @@ function currentTimelineIndex() {
 }
 
 function goToTimelineEntry(idx) {
-  if (faceEditContext || faceSelectMode) return;
+  if (faceEditContext || faceSelectMode || newPlaneMode) return;
   const entry = timelineEntries()[idx];
   if (!entry) return;
   if (entry.type === 'base') {
     baseRollback = true;
-    if (extrudedGroup) {
-      viewerScene.remove(extrudedGroup);
-      extrudedGroup = null;
-      meshVersion++;
-      faceAdjacencyCache = null;
-    }
     btnExport.disabled = true;
-    extrudeStatusEl.textContent = 'Zurückgerollt zur Basis-Skizze. „Extrudieren“ klicken, um bis zum Ende des Verlaufs zu aktualisieren.';
+    extrudeStatusEl.textContent = 'Zurückgerollt zur Basis-Skizze (Vorschau zeigt nur die Basis, ohne Flächen-Features). „Übernehmen“ klicken, um bis zum Ende des Verlaufs zu aktualisieren.';
     selectedShapeIds.clear();
     renderShapeList();
     updateFaceEditUI();
     render();
+    // Immediately show the base-only preview (see runLivePreview's baseRollback
+    // branch) rather than waiting for the debounce or the first edit.
+    cancelLivePreview();
+    runLivePreview();
   } else {
     baseRollback = false;
     reopenFaceFeature(entry.feature.id);
@@ -4229,7 +4571,7 @@ function goToTimelineEntry(idx) {
 // Cancels a base rollback that hasn't been re-extruded yet, restoring the
 // full end-of-history model without requiring any sketch changes.
 function jumpToEndOfHistory() {
-  if (faceEditContext || faceSelectMode || !baseRollback) return;
+  if (faceEditContext || faceSelectMode || newPlaneMode || !baseRollback) return;
   rebuildSolid();
 }
 
@@ -4239,7 +4581,7 @@ function renderHistoryTree() {
   el.innerHTML = '';
   const entries = timelineEntries();
   const curIdx = currentTimelineIndex();
-  const busy = !!faceEditContext || faceSelectMode;
+  const busy = !!faceEditContext || faceSelectMode || newPlaneMode;
 
   entries.forEach((entry, idx) => {
     const item = document.createElement('div');
@@ -4290,7 +4632,7 @@ function renderHistoryTree() {
   if (busy) {
     const hint = document.createElement('div');
     hint.className = 'history-hint';
-    hint.textContent = 'Erst „Extrudieren“ oder „Abbrechen“, um eine andere Skizze zu wählen.';
+    hint.textContent = 'Erst „Übernehmen“ oder „Abbrechen“, um eine andere Skizze zu wählen.';
     el.appendChild(hint);
   }
 }
@@ -4302,14 +4644,16 @@ function updateFaceEditUI() {
 
   if (selectHint) selectHint.style.display = faceSelectMode ? 'flex' : 'none';
   if (editControls) editControls.style.display = faceEditContext ? 'flex' : 'none';
-  btnEditFace.disabled = !extrudedGroup || faceSelectMode || !!faceEditContext;
+  if (newPlanePanelBlock) newPlanePanelBlock.style.display = newPlaneMode ? 'block' : 'none';
+  btnEditFace.disabled = !modelCommitted || faceSelectMode || !!faceEditContext || newPlaneMode;
+  btnNewPlane.disabled = !modelCommitted || faceSelectMode || !!faceEditContext || newPlaneMode;
 
   if (title) {
     if (faceEditContext) {
       const idx = faceEditContext.featureId ? faceFeatures.findIndex((f) => f.id === faceEditContext.featureId) : faceFeatures.length;
-      title.textContent = `Flächen-Skizze — Skizze ${idx + 2} — bearbeiten und „Extrudieren“ klicken`;
+      title.textContent = `Flächen-Skizze — Skizze ${idx + 2} — bearbeiten und „Übernehmen“ klicken`;
     } else if (baseRollback) {
-      title.textContent = 'Basis-Skizze (zurückgerollt) — bearbeiten und „Extrudieren“ klicken';
+      title.textContent = 'Basis-Skizze (zurückgerollt) — bearbeiten und „Übernehmen“ klicken';
     } else {
       title.textContent = '2D Skizze (Klicken zum Zeichnen)';
     }
@@ -4320,9 +4664,17 @@ function updateFaceEditUI() {
 const btnEditFace = document.getElementById('btn-edit-face');
 const btnCancelFaceSelect = document.getElementById('btn-cancel-face-select');
 const btnCancelFaceEdit = document.getElementById('btn-cancel-face-edit');
+const btnNewPlane = document.getElementById('btn-new-plane');
+const newPlanePanelBlock = document.getElementById('new-plane-panel-block');
+const planeAxisButtons = Array.from(document.querySelectorAll('#new-plane-panel-block [data-axis]'));
+const planeOffsetInput = document.getElementById('plane-offset');
+const planeAngleInput = document.getElementById('plane-angle');
+const planeFlipInput = document.getElementById('plane-flip');
+const btnCreatePlane = document.getElementById('btn-create-plane');
+const btnCancelPlane = document.getElementById('btn-cancel-plane');
 
 btnEditFace.addEventListener('click', () => {
-  if (!extrudedGroup || faceEditContext) return;
+  if (!modelCommitted || faceEditContext || faceSelectMode || newPlaneMode) return;
   faceSelectMode = true;
   updateFaceEditUI();
 });
@@ -4334,6 +4686,80 @@ btnCancelFaceSelect.addEventListener('click', () => {
 });
 
 btnCancelFaceEdit.addEventListener('click', () => exitFaceEditMode(false));
+
+// ---- "Neue Ebene" (datum plane) panel wiring ---------------------------------
+
+function openNewPlanePanel() {
+  if (!modelCommitted || faceEditContext || faceSelectMode || newPlaneMode) return;
+  newPlaneMode = true;
+  newPlaneConfig = { axis: 'z', offset: 0, angle: 0, flip: false };
+  planeAxisButtons.forEach((b) => b.classList.toggle('active', b.dataset.axis === 'z'));
+  planeOffsetInput.value = '0';
+  planeAngleInput.value = '0';
+  planeFlipInput.checked = false;
+  // Only configuring where the plane goes here - there's no feature sketch
+  // yet to commit, so "Übernehmen" doesn't apply until "Ebene erstellen"
+  // actually starts one (closeNewPlanePanel below re-enables it either way:
+  // on create, entering the feature sketch; on cancel, back to normal).
+  // Safe to disable unconditionally here (unlike doing this from
+  // updateFaceEditUI, which also runs during the OC-kernel-loading window
+  // and mid-drag) since reaching this point already required modelCommitted,
+  // which itself required a completed rebuildSolid() - the kernel is loaded.
+  btnExtrude.disabled = true;
+  updateFaceEditUI();
+  updateNewPlanePreview();
+}
+
+function closeNewPlanePanel() {
+  newPlaneMode = false;
+  clearNewPlanePreview();
+  btnExtrude.disabled = false;
+  updateFaceEditUI();
+}
+
+btnNewPlane.addEventListener('click', openNewPlanePanel);
+
+planeAxisButtons.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    newPlaneConfig.axis = btn.dataset.axis;
+    planeAxisButtons.forEach((b) => b.classList.toggle('active', b === btn));
+    updateNewPlanePreview();
+  });
+});
+
+planeOffsetInput.addEventListener('input', () => {
+  newPlaneConfig.offset = parseFloat(planeOffsetInput.value) || 0;
+  updateNewPlanePreview();
+});
+
+planeAngleInput.addEventListener('input', () => {
+  newPlaneConfig.angle = parseFloat(planeAngleInput.value) || 0;
+  updateNewPlanePreview();
+});
+
+planeFlipInput.addEventListener('change', () => {
+  newPlaneConfig.flip = planeFlipInput.checked;
+  updateNewPlanePreview();
+});
+
+btnCancelPlane.addEventListener('click', closeNewPlanePanel);
+
+// Commits the configured datum plane as a brand-new face feature (featureId:
+// null) with no picked-face outline (boundaryLoopUV/innerLoopsUV empty) -
+// enterFaceEditMode/exitFaceEditMode then handle it exactly like a feature
+// sketched on a real picked face: real BREP boolean fuse/cut against the
+// existing solid live (see runLivePreview) and finalized on "Übernehmen", and
+// its own entry in the Verlauf timeline.
+// The current model's edges (currentSolidForPicking - accurate here since
+// "Neue Ebene" is only enabled at the true end of the timeline, never mid
+// rollback/edit) are projected onto the new plane as a reference wireframe -
+// see projectSolidEdgesToUV / drawFaceReferenceOutline.
+btnCreatePlane.addEventListener('click', () => {
+  const basis = computeCustomPlaneBasis(newPlaneConfig.axis, newPlaneConfig.offset, newPlaneConfig.angle, newPlaneConfig.flip);
+  const modelReferenceUV = projectSolidEdgesToUV(currentSolidForPicking, basis);
+  closeNewPlanePanel();
+  enterFaceEditMode({ featureId: null, basis, boundaryLoopUV: [], innerLoopsUV: [], modelReferenceUV });
+});
 
 // ===========================================================================
 // Project save / load (editable .mrcad project file, separate from STL export)
@@ -4372,6 +4798,7 @@ function serializeProject() {
       },
       boundaryLoopUV: f.boundaryLoopUV,
       innerLoopsUV: f.innerLoopsUV,
+      modelReferenceUV: f.modelReferenceUV || [],
       shapes: f.shapes,
       backgroundImages: (f.backgroundImages || []).map(bg => ({ id: bg.id, dataUrl: bg.dataUrl, x1: bg.x1, y1: bg.y1, x2: bg.x2, y2: bg.y2 })),
     })),
@@ -4394,7 +4821,7 @@ btnSaveProject.addEventListener('click', () => {
 });
 
 btnLoadProject.addEventListener('click', () => {
-  if (faceEditContext || faceSelectMode) {
+  if (faceEditContext || faceSelectMode || newPlaneMode) {
     alert('Bitte erst die aktuelle Flächen-Bearbeitung übernehmen oder abbrechen.');
     return;
   }
@@ -4451,6 +4878,8 @@ function loadProject(data) {
   faceSelectMode = false;
   faceEditContext = null;
   baseRollback = false;
+  newPlaneMode = false;
+  clearNewPlanePreview();
   selectedShapeIds.clear();
   selectedBgImageId = null;
   panState = null;
@@ -4486,6 +4915,7 @@ function loadProject(data) {
     },
     boundaryLoopUV: f.boundaryLoopUV,
     innerLoopsUV: f.innerLoopsUV || [],
+    modelReferenceUV: f.modelReferenceUV || [],
     shapes: f.shapes,
     backgroundImages: hydrateBackgroundImages(f.backgroundImages),
   }));
