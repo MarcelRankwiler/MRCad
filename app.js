@@ -77,6 +77,24 @@ let faceSelectMode = false;  // waiting for a click on the 3D model to pick a fa
 // the stashed base sketch's `shapes`/`history`, restored on exit
 let faceEditContext = null;
 let baseRollback = false; // true while the history tree is temporarily rolled back to the base sketch (3D preview shows base only, "Übernehmen" pending - see runLivePreview)
+// id of the faceFeatures entry whose sketch is currently loaded into
+// `shapes`/`history`/`backgroundImages` for 2D display/editing, or null if
+// the base sketch is loaded there instead. Independent of faceEditContext,
+// which is only non-null while *actively*, not-yet-committed mid-editing -
+// after "Übernehmen"/"Abbrechen" faceEditContext goes back to null, but
+// activeFeatureId can stay pointed at the just-finished feature so its
+// sketch remains the one shown/editable in the 2D view without needing to be
+// reopened - switching the display to a different sketch (including back to
+// the base) only happens via an explicit Verlauf click (see
+// goToTimelineEntry/reopenFaceFeature/deleteFaceFeature).
+let activeFeatureId = null;
+// {shapes, backgroundImages} - the base sketch's own data, stashed here the
+// moment `shapes` stops pointing at it (see enterFaceEditMode) so it survives
+// even after "Übernehmen" leaves activeFeatureId pointed at a feature instead
+// of restoring the base automatically. Null whenever the base sketch IS what
+// `shapes` currently holds (i.e. whenever activeFeatureId is null) - see
+// currentBaseSketch().
+let baseShapesStash = null;
 let meshVersion = 0;         // bumped whenever extrudedGroup is rebuilt; invalidates faceAdjacencyCache
 let faceAdjacencyCache = null; // {version, byObject: Map(mesh -> adjacency)}
 let hoverFaceHighlight = null;    // THREE.Mesh overlay for the currently hovered pickable face
@@ -698,8 +716,15 @@ function render() {
 
   drawGrid(w, h);
 
-  // reference outline of the face being sketched on, if any (fixed, non-interactive)
-  if (faceEditContext) drawFaceReferenceOutline();
+  // reference outline of the face being sketched on, if any (fixed, non-interactive) -
+  // while actively mid-edit, or still showing a just-committed feature's sketch
+  // (see activeFeatureId)
+  if (faceEditContext) {
+    drawFaceReferenceOutline(faceEditContext);
+  } else if (activeFeatureId != null) {
+    const f = faceFeatures.find((x) => x.id === activeFeatureId);
+    if (f) drawFaceReferenceOutline(f);
+  }
 
   // finished shapes
   shapes.forEach(shape => drawShape(shape, selectedShapeIds.has(shape.id), shape.id === errorShapeId));
@@ -989,7 +1014,11 @@ function drawShape(shape, selected, isError) {
 // Draws the outline of the picked face (dashed, non-interactive) as a fixed
 // reference underlay while sketching a face feature, so the user can see the
 // face's boundary (and any pre-existing inner holes in it) while drawing.
-function drawFaceReferenceOutline() {
+// `source` is either the live faceEditContext (while actively mid-edit) or a
+// committed faceFeatures entry (while merely displaying one as the active
+// sketch post-"Übernehmen", see activeFeatureId) - both carry the same
+// boundaryLoopUV/innerLoopsUV/modelReferenceUV fields.
+function drawFaceReferenceOutline(source) {
   const drawLine = (loop, close) => {
     if (!loop || loop.length < 2) return;
     ctx.beginPath();
@@ -1002,8 +1031,8 @@ function drawFaceReferenceOutline() {
   ctx.strokeStyle = '#777';
   ctx.setLineDash([4 / viewScale, 3 / viewScale]);
   ctx.lineWidth = 1.5 / viewScale;
-  drawLine(faceEditContext.boundaryLoopUV, true);
-  (faceEditContext.innerLoopsUV || []).forEach((l) => drawLine(l, true));
+  drawLine(source.boundaryLoopUV, true);
+  (source.innerLoopsUV || []).forEach((l) => drawLine(l, true));
   ctx.restore();
 
   // Free-standing datum-plane features (see computeCustomPlaneBasis) have no
@@ -1013,7 +1042,7 @@ function drawFaceReferenceOutline() {
   // plane that may not touch it at all. Frozen at the moment the plane was
   // created (see projectSolidEdgesToUV / btnCreatePlane), same "fixed
   // position" convention as boundaryLoopUV.
-  const refEdges = faceEditContext.modelReferenceUV;
+  const refEdges = source.modelReferenceUV;
   if (refEdges && refEdges.length) {
     ctx.save();
     ctx.strokeStyle = '#4a7dfc';
@@ -3052,6 +3081,8 @@ function doClearSketch() {
   faceSelectMode = false;
   faceEditContext = null;
   baseRollback = false;
+  activeFeatureId = null;
+  baseShapesStash = null;
   newPlaneMode = false;
   clearNewPlanePreview();
   selectedShapeIds.clear();
@@ -3399,7 +3430,7 @@ async function rebuildSolid() {
 
   let result;
   try {
-    result = buildPreviewSolid(shapes, faceFeatures, true);
+    result = buildPreviewSolid(currentBaseSketch().shapes, faceFeatures, true);
   } catch (err) {
     // OpenCascade doesn't validate a sketch profile up front - a self-intersecting
     // outline (most often an over-bent curved line, see MAX_BULGE, or two shapes
@@ -3489,9 +3520,9 @@ function scheduleLivePreview() {
 //   showRollbackPreview() this replaces: they depend on geometry that's
 //   currently being changed, so showing them would lie about the result.
 // - editing a face/plane feature (see enterFaceEditMode): the real base
-//   sketch (faceEditContext.baseShapes, NOT the module-level `shapes`, which
-//   right now IS the feature's own in-progress sketch) + every earlier
-//   committed feature + this one's live, not-yet-committed shapes.
+//   sketch (currentBaseSketch(), NOT the module-level `shapes`, which right
+//   now IS the feature's own in-progress sketch) + every earlier committed
+//   feature + this one's live, not-yet-committed shapes.
 async function runLivePreview() {
   livePreviewTimer = null;
   await window.ocReadyPromise;
@@ -3505,7 +3536,7 @@ async function runLivePreview() {
     const idx = faceEditContext.featureId
       ? faceFeatures.findIndex((f) => f.id === faceEditContext.featureId)
       : faceFeatures.length;
-    baseShapesSrc = faceEditContext.baseShapes;
+    baseShapesSrc = currentBaseSketch().shapes;
     featureList = [...faceFeatures.slice(0, idx), { basis: faceEditContext.basis, shapes }];
     includeFillets = true;
   } else if (baseRollback) {
@@ -3513,7 +3544,7 @@ async function runLivePreview() {
     featureList = [];
     includeFillets = false;
   } else {
-    baseShapesSrc = shapes;
+    baseShapesSrc = currentBaseSketch().shapes;
     featureList = faceFeatures;
     includeFillets = true;
   }
@@ -3604,14 +3635,33 @@ function polygonCentroid(pts) {
 // Builds a stable 2D (u,v) basis on a plane given its world-space normal and
 // an origin point on it. For top/bottom faces (normal ~ world Z) falls back
 // to world X as the reference axis since up×normal would be degenerate there.
+//
+// `flipV` (returned alongside u/v/normal): the base sketch's own 2D canvas
+// uses a Y-down convention, so shapeToDrawing() negates Y when building the
+// actual replicad profile placed on the world XY plane (see its own
+// comment) - meaning any point on a face directly copied from that flat
+// profile (an "up"-facing top face) has world Y = -(that shape's own y).
+// Picking such a face and sketching on it again would otherwise show/build
+// upside-down relative to the original sketch it came from. A "down"-facing
+// pick (normal ~ -Z, e.g. the underside) doesn't need this: crossing the
+// (now negated) normal into uAxis already flips vAxis itself, which happens
+// to already cancel the base sketch's own flip. So only the +Z case needs an
+// explicit correction. extrudeFaceShape applies the matching compensation
+// when actually building a shape's profile on this basis (see its own
+// flipV usage) - vAxis here and that compensation must always agree, or a
+// sketch's on-screen reference and where it actually extrudes to would
+// disagree with each other instead.
 function buildFaceBasis(normal, origin) {
   const n = normal.clone().normalize();
   const worldUp = new THREE.Vector3(0, 0, 1);
-  const uAxis = Math.abs(n.dot(worldUp)) > 0.999
+  const isNearVertical = Math.abs(n.dot(worldUp)) > 0.999;
+  const uAxis = isNearVertical
     ? new THREE.Vector3(1, 0, 0)
     : new THREE.Vector3().crossVectors(worldUp, n).normalize();
+  const flipV = isNearVertical && n.z > 0;
   const vAxis = new THREE.Vector3().crossVectors(n, uAxis).normalize();
-  return { origin: origin.clone(), normal: n, uAxis, vAxis };
+  if (flipV) vAxis.negate();
+  return { origin: origin.clone(), normal: n, uAxis, vAxis, flipV };
 }
 
 function worldToUV(p, basis) {
@@ -3941,8 +3991,12 @@ function replicadPlaneFromBasis(basis, offsetAlongNormal) {
 // Builds a boss/pocket Shape3D on a picked face's basis, spanning from
 // `alongNormalFrom` to `alongNormalTo` (signed offsets from the face plane
 // along its normal) - the BREP equivalent of the old extrudeFaceShape.
+// `basis.flipV` (see buildFaceBasis) mirrors the same y-negation the base
+// sketch itself uses, so the actual 3D placement agrees with the basis's own
+// vAxis/worldToUV - without it, a "top"-facing pick's reference outline would
+// show right-side-up while a fresh sketch on it actually built upside-down.
 function extrudeFaceShape(shape, basis, alongNormalFrom, alongNormalTo) {
-  const drawing = shapeToDrawing(shape, false);
+  const drawing = shapeToDrawing(shape, !!basis.flipV);
   const plane = replicadPlaneFromBasis(basis, alongNormalFrom);
   const depth = alongNormalTo - alongNormalFrom;
   return drawing.sketchOnPlane(plane).extrude(depth);
@@ -4388,14 +4442,32 @@ function fitViewToLoop(loop) {
   viewOffset = { x: w / 2 - cx * viewScale, y: h / 2 - cy * viewScale };
 }
 
+// The base sketch's own {shapes, backgroundImages}, regardless of whether
+// `shapes`/`backgroundImages` currently hold the base's data or some other
+// feature's - reads straight through only when the base IS what's loaded
+// there (no feature is being live-edited AND none is the active display
+// target, see faceEditContext/activeFeatureId), or the stashed copy
+// otherwise. `shapes` is NEVER the base while faceEditContext is set (it's
+// always been swapped to the feature's own sketch by then, however
+// activeFeatureId itself only gets updated once that edit ends - see
+// enterFaceEditMode/exitFaceEditMode), so that has to be checked too, not
+// just activeFeatureId. Used anywhere that needs "the real base sketch"
+// specifically: building the base solid (rebuildSolid/runLivePreview) and
+// saving a project.
+function currentBaseSketch() {
+  return (!faceEditContext && activeFeatureId === null) ? { shapes, backgroundImages } : baseShapesStash;
+}
+
 // True while enterFaceEditMode() is (re-)locating an existing feature's face
 // on the rolled-back solid - guards against a second click re-entering
 // before faceEditContext is set (see enterFaceEditMode).
 // Swaps the module-level `shapes`/`history` to a face feature's own sketch
 // (new, empty for a brand-new feature, or a previously-saved one when
-// re-editing), stashing the base sketch to restore later. All in-progress
-// drawing/editor state is force-reset rather than preserved across the
-// switch, matching the existing pattern setTool() already uses for tool changes.
+// re-editing), stashing whatever was displayed before (the base sketch, or
+// another feature - see activeFeatureId) to restore on "Abbrechen". All
+// in-progress drawing/editor state is force-reset rather than preserved
+// across the switch, matching the existing pattern setTool() already uses
+// for tool changes.
 //
 // Always shows the feature's originally stored basis/boundaryLoopUV, even if
 // the base sketch has since changed shape - features stay fixed at their
@@ -4416,15 +4488,24 @@ function enterFaceEditMode(pick) {
   const existingIdx = pick.featureId ? faceFeatures.findIndex((f) => f.id === pick.featureId) : -1;
   const existing = existingIdx >= 0 ? faceFeatures[existingIdx] : null;
 
+  // Leaving the base sketch for the first time (it's not already stashed
+  // because some other feature was active) - stash it now so it survives
+  // even if we end up staying on a feature's sketch past this edit (see
+  // exitFaceEditMode). If another feature was already active instead, its
+  // data lives on as that feature's own `.shapes`/`.backgroundImages` (see
+  // exitFaceEditMode's commit branch), so there's nothing to stash for it.
+  if (activeFeatureId === null) baseShapesStash = { shapes, backgroundImages };
+
   faceEditContext = {
     featureId: pick.featureId || null,
     basis: pick.basis,
     boundaryLoopUV: pick.boundaryLoopUV,
     innerLoopsUV: pick.innerLoopsUV || [],
     modelReferenceUV: pick.modelReferenceUV || [],
-    baseShapes: shapes,
-    baseHistory: history,
-    baseBackgroundImages: backgroundImages,
+    previousShapes: shapes,
+    previousHistory: history,
+    previousBackgroundImages: backgroundImages,
+    previousActiveFeatureId: activeFeatureId,
   };
 
   // Deep-clone so in-place edits (dragging a point, changing a length, adding
@@ -4469,13 +4550,15 @@ function exitFaceEditMode(commit) {
   selectedBgImageId = null;
 
   const ctx = faceEditContext;
+  let committedFeatureId = null;
   if (commit) {
     if (ctx.featureId) {
       const f = faceFeatures.find((x) => x.id === ctx.featureId);
       f.shapes = shapes;
       f.backgroundImages = backgroundImages;
+      committedFeatureId = f.id;
     } else {
-      faceFeatures.push({
+      const f = {
         id: nextFeatureId++,
         basis: ctx.basis,
         boundaryLoopUV: ctx.boundaryLoopUV,
@@ -4483,23 +4566,39 @@ function exitFaceEditMode(commit) {
         modelReferenceUV: ctx.modelReferenceUV,
         shapes: shapes,
         backgroundImages: backgroundImages,
-      });
+      };
+      faceFeatures.push(f);
+      committedFeatureId = f.id;
     }
     markProjectDirty();
   }
 
-  shapes = ctx.baseShapes;
-  history = ctx.baseHistory;
-  backgroundImages = ctx.baseBackgroundImages;
+  if (commit) {
+    // "Übernehmen" locks the sketch into faceFeatures but keeps it the
+    // active/editable one in the 2D view - matching how the base sketch has
+    // always stayed directly editable after any change, instead of jumping
+    // back to the base automatically. `shapes`/`history`/`backgroundImages`
+    // already ARE this feature's own live data (same references just saved
+    // onto it above), so there's nothing to swap here.
+    activeFeatureId = committedFeatureId;
+  } else {
+    // "Abbrechen": discard this edit, go back to whatever was displayed
+    // before it started (the base sketch, or another feature).
+    shapes = ctx.previousShapes;
+    history = ctx.previousHistory;
+    backgroundImages = ctx.previousBackgroundImages;
+    activeFeatureId = ctx.previousActiveFeatureId;
+  }
   faceEditContext = null;
   clearSelectedHighlight();
   clearHoverHighlight();
   renderShapeList();
 
-  // Whether committed or cancelled, leaving edit mode always jumps back to
-  // the end of the timeline: rebuild from the base sketch through every
-  // feature (using the just-saved shapes when committed, the untouched
-  // feature otherwise), replacing the temporary rollback preview.
+  // Whether committed or cancelled, the 3D model always jumps back to the
+  // end of the timeline: rebuild from the base sketch through every feature
+  // (using the just-saved shapes when committed, the untouched feature
+  // otherwise), replacing the temporary rollback preview. Which sketch stays
+  // open in the 2D view (see activeFeatureId above) is independent of this.
   rebuildSolid();
   render();
 }
@@ -4514,6 +4613,17 @@ function reopenFaceFeature(id) {
 function deleteFaceFeature(id) {
   if (faceEditContext || faceSelectMode || newPlaneMode) return;
   faceFeatures = faceFeatures.filter((f) => f.id !== id);
+  // The 2D view was showing this feature's now-deleted sketch - fall back to
+  // the base sketch rather than leaving `shapes` pointed at an orphaned array.
+  if (activeFeatureId === id) {
+    if (baseShapesStash) {
+      shapes = baseShapesStash.shapes;
+      backgroundImages = baseShapesStash.backgroundImages;
+    }
+    history = [];
+    activeFeatureId = null;
+    renderShapeList();
+  }
   markProjectDirty();
   rebuildSolid();
 }
@@ -4532,8 +4642,10 @@ function timelineEntries() {
   return entries;
 }
 
-// Index into timelineEntries() of the entry currently being (re-)edited, or
-// null when the model reflects the full, un-rolled-back end of the history.
+// Index into timelineEntries() of the entry currently open in the 2D view -
+// either being actively (re-)edited, or just left there as the active
+// display target after a previous "Übernehmen" (see activeFeatureId) - or
+// null when the base sketch is what's open and nothing is mid-edit.
 function currentTimelineIndex() {
   if (baseRollback) return 0;
   if (faceEditContext) {
@@ -4543,6 +4655,10 @@ function currentTimelineIndex() {
     }
     return faceFeatures.length + 1; // brand-new feature, sketched beyond the current end - nothing to suppress
   }
+  if (activeFeatureId != null) {
+    const i = faceFeatures.findIndex((f) => f.id === activeFeatureId);
+    return i >= 0 ? i + 1 : null;
+  }
   return null;
 }
 
@@ -4551,6 +4667,16 @@ function goToTimelineEntry(idx) {
   const entry = timelineEntries()[idx];
   if (!entry) return;
   if (entry.type === 'base') {
+    // Switch the 2D view back to the base sketch if some feature was the
+    // active display target instead (see activeFeatureId/deleteFaceFeature).
+    if (activeFeatureId !== null) {
+      if (baseShapesStash) {
+        shapes = baseShapesStash.shapes;
+        backgroundImages = baseShapesStash.backgroundImages;
+      }
+      history = [];
+      activeFeatureId = null;
+    }
     baseRollback = true;
     btnExport.disabled = true;
     extrudeStatusEl.textContent = 'Zurückgerollt zur Basis-Skizze (Vorschau zeigt nur die Basis, ohne Flächen-Features). „Übernehmen“ klicken, um bis zum Ende des Verlaufs zu aktualisieren.';
@@ -4583,12 +4709,20 @@ function renderHistoryTree() {
   const curIdx = currentTimelineIndex();
   const busy = !!faceEditContext || faceSelectMode || newPlaneMode;
 
+  // Later entries only get visually "suppressed" while truly mid-edit
+  // (faceEditContext/baseRollback) - reopening an earlier feature rolls later
+  // ones out of the live preview (see runLivePreview), so marking them as
+  // such is accurate there. Merely having a feature as the active display
+  // target after "Übernehmen" (activeFeatureId, no live edit in progress)
+  // doesn't suppress anything - the 3D model already includes every feature.
+  const midEdit = !!faceEditContext || baseRollback;
+
   entries.forEach((entry, idx) => {
     const item = document.createElement('div');
     item.className = 'history-item';
     if (curIdx !== null) {
       if (idx === curIdx) item.classList.add('editing');
-      else if (idx > curIdx) item.classList.add('suppressed');
+      else if (idx > curIdx && midEdit) item.classList.add('suppressed');
     }
 
     const icon = document.createElement('span');
@@ -4654,6 +4788,9 @@ function updateFaceEditUI() {
       title.textContent = `Flächen-Skizze — Skizze ${idx + 2} — bearbeiten und „Übernehmen“ klicken`;
     } else if (baseRollback) {
       title.textContent = 'Basis-Skizze (zurückgerollt) — bearbeiten und „Übernehmen“ klicken';
+    } else if (activeFeatureId != null) {
+      const idx = faceFeatures.findIndex((f) => f.id === activeFeatureId);
+      title.textContent = `Flächen-Skizze — Skizze ${idx + 2} (übernommen, weiter bearbeitbar)`;
     } else {
       title.textContent = '2D Skizze (Klicken zum Zeichnen)';
     }
@@ -4780,14 +4917,18 @@ function plainToVec3(p) {
 // face-sketch feature (with its Vector3 basis flattened to plain {x,y,z} so
 // it round-trips through JSON).
 function serializeProject() {
+  // `shapes`/`backgroundImages` may currently be showing a feature's sketch
+  // rather than the base's (see activeFeatureId) - the base's own data always
+  // needs currentBaseSketch() to find it in that case.
+  const base = currentBaseSketch();
   return {
     fileType: 'mrcad-project',
     version: PROJECT_FILE_VERSION,
     nextShapeId,
     nextFeatureId,
     nextEdgeFilletId,
-    shapes,
-    backgroundImages: backgroundImages.map(bg => ({ id: bg.id, dataUrl: bg.dataUrl, x1: bg.x1, y1: bg.y1, x2: bg.x2, y2: bg.y2 })),
+    shapes: base.shapes,
+    backgroundImages: base.backgroundImages.map(bg => ({ id: bg.id, dataUrl: bg.dataUrl, x1: bg.x1, y1: bg.y1, x2: bg.x2, y2: bg.y2 })),
     faceFeatures: faceFeatures.map(f => ({
       id: f.id,
       basis: {
@@ -4795,6 +4936,7 @@ function serializeProject() {
         normal: vec3ToPlain(f.basis.normal),
         uAxis: vec3ToPlain(f.basis.uAxis),
         vAxis: vec3ToPlain(f.basis.vAxis),
+        flipV: !!f.basis.flipV,
       },
       boundaryLoopUV: f.boundaryLoopUV,
       innerLoopsUV: f.innerLoopsUV,
@@ -4878,6 +5020,8 @@ function loadProject(data) {
   faceSelectMode = false;
   faceEditContext = null;
   baseRollback = false;
+  activeFeatureId = null;
+  baseShapesStash = null;
   newPlaneMode = false;
   clearNewPlanePreview();
   selectedShapeIds.clear();
@@ -4912,6 +5056,7 @@ function loadProject(data) {
       normal: plainToVec3(f.basis.normal),
       uAxis: plainToVec3(f.basis.uAxis),
       vAxis: plainToVec3(f.basis.vAxis),
+      flipV: !!f.basis.flipV, // false for project files saved before this field existed - matches their original (unflipped) behavior
     },
     boundaryLoopUV: f.boundaryLoopUV,
     innerLoopsUV: f.innerLoopsUV || [],
