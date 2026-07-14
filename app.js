@@ -3636,21 +3636,29 @@ function polygonCentroid(pts) {
 // an origin point on it. For top/bottom faces (normal ~ world Z) falls back
 // to world X as the reference axis since up×normal would be degenerate there.
 //
-// `flipV` (returned alongside u/v/normal): the base sketch's own 2D canvas
-// uses a Y-down convention, so shapeToDrawing() negates Y when building the
-// actual replicad profile placed on the world XY plane (see its own
-// comment) - meaning any point on a face directly copied from that flat
-// profile (an "up"-facing top face) has world Y = -(that shape's own y).
-// Picking such a face and sketching on it again would otherwise show/build
-// upside-down relative to the original sketch it came from. A "down"-facing
-// pick (normal ~ -Z, e.g. the underside) doesn't need this: crossing the
-// (now negated) normal into uAxis already flips vAxis itself, which happens
-// to already cancel the base sketch's own flip. So only the +Z case needs an
-// explicit correction. extrudeFaceShape applies the matching compensation
-// when actually building a shape's profile on this basis (see its own
-// flipV usage) - vAxis here and that compensation must always agree, or a
-// sketch's on-screen reference and where it actually extrudes to would
-// disagree with each other instead.
+// `flipV` (returned alongside u/v/normal): the 2D canvas is Y-down (larger
+// model-y draws lower on screen, see worldToScreen), so for the mapping to
+// feel right, moving DOWN on the canvas must move geometry DOWN in the world
+// too - i.e. vAxis (the world direction the canvas's +y points along) has to
+// point "down-ish", not "up-ish". The raw cross-product vAxis always comes
+// out pointing up-ish instead, so it usually needs negating:
+//   - Sloped/vertical (wall) faces: the un-negated vAxis = n × uAxis always
+//     has a non-negative Z component (its Z is 1 - n.z^2 >= 0), i.e. it points
+//     up. Without correction, a circle drawn at the top of the 2D sketch
+//     extrudes at the BOTTOM of the wall in 3D (and vice versa). So these
+//     always flip.
+//   - Top face (normal ~ +Z): the flat base profile, whose own y was already
+//     negated by shapeToDrawing when placed on world XY, reads back with
+//     world Y = -(shape y); flipping here restores the original orientation so
+//     re-sketching on it isn't upside down. Flips.
+//   - Bottom face (normal ~ -Z, the underside): crossing the (already -Z)
+//     normal into uAxis flips vAxis on its own, which happens to already
+//     cancel the base sketch's flip - viewed from below, that's the correct
+//     (mirrored) orientation. Does NOT flip.
+// extrudeFaceShape applies the matching y-negation when actually building a
+// shape's profile on this basis (see its own flipV usage) - vAxis here and
+// that compensation must always agree, or a sketch's on-screen reference and
+// where it actually extrudes to would disagree with each other instead.
 function buildFaceBasis(normal, origin) {
   const n = normal.clone().normalize();
   const worldUp = new THREE.Vector3(0, 0, 1);
@@ -3658,7 +3666,9 @@ function buildFaceBasis(normal, origin) {
   const uAxis = isNearVertical
     ? new THREE.Vector3(1, 0, 0)
     : new THREE.Vector3().crossVectors(worldUp, n).normalize();
-  const flipV = isNearVertical && n.z > 0;
+  // Flip for everything except the underside (bottom) face - see the cases in
+  // the comment above.
+  const flipV = isNearVertical ? n.z > 0 : true;
   const vAxis = new THREE.Vector3().crossVectors(n, uAxis).normalize();
   if (flipV) vAxis.negate();
   return { origin: origin.clone(), normal: n, uAxis, vAxis, flipV };
@@ -3708,7 +3718,18 @@ function computeCustomPlaneBasis(axis, offsetMm, angleDeg, flip) {
     normal.negate();
     vAxis.negate();
   }
-  return { origin, normal, uAxis, vAxis };
+  // Same canvas Y-down correction as buildFaceBasis's near-vertical case: a
+  // datum plane parallel to the base XY sketch plane (normal pointing "up",
+  // i.e. +Z, same as the default/most common "Neue Ebene") must use the same
+  // flipV convention the base sketch itself uses, or its modelReferenceUV
+  // (the existing model's edges, projected via worldToUV) shows vertically
+  // mirrored relative to what a fresh sketch on it actually builds (see
+  // buildFaceBasis's own comment for the full explanation).
+  const worldUp = new THREE.Vector3(0, 0, 1);
+  const isNearVertical = Math.abs(normal.dot(worldUp)) > 0.999;
+  const flipV = isNearVertical && normal.z > 0;
+  if (flipV) vAxis.negate();
+  return { origin, normal, uAxis, vAxis, flipV };
 }
 
 const NEW_PLANE_PREVIEW_MATERIAL = new THREE.MeshBasicMaterial({ color: 0x5fd06b, transparent: true, opacity: 0.28, depthTest: true, side: THREE.DoubleSide });
