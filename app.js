@@ -22,6 +22,8 @@ let curveBulgeEdgeIndex = null; // drawingBulges key the mouse is currently adju
 let closePending = false; // true while bending the closing edge (Shift-click on the start point) - finishPolygon() runs on Shift-up instead of immediately
 let circleCenter = null;  // in-progress circle center
 let shapeStartPoint = null; // in-progress rect/regular-polygon tool: first click (corner or center)
+let splineProfileCenter = null; // in-progress Vielkeilprofil tool: center placed by the last click, while the panel is being configured - see computeSplineProfile()
+let splineProfileEditId = null; // id of an existing 'splineprofile' shape currently bound to the panel for post-hoc editing (via the shape list's "Bearbeiten" button), or null
 let mousePos = null;      // current mouse position (canvas space), for previews
 let selectedShapeIds = new Set(); // Ctrl/Cmd-click adds/removes a shape in the 'select' tool, for multi-drag/multi-edit
 let selectedSegment = null; // 'lineselect' tool: {shapeId, segIndex} of the currently picked edge, or null - Delete opens the shape at that edge
@@ -307,6 +309,192 @@ function shapeToolPoints(tool, start, p) {
   const r = dist(start, p);
   const angle = Math.atan2(p.y - start.y, p.x - start.x);
   return regularPolygonPoints(start, r, sides, angle);
+}
+
+// ===========================================================================
+// Vielkeilprofil tool: a parametric involute spline/gear profile. Each tooth
+// flank is a true involute of the base circle -
+//   x(t) = rb*(cos t + t*sin t),  y(t) = rb*(sin t - t*cos t)
+// - never approximated by line segments standing in for an arc or a
+// triangle; only the *tessellation* of that exact curve (and of the tip/root
+// arcs) is done with line segments, same as every other curved edge in this
+// app (see filletCornerArc/arcBulgePoints above). The result is a plain
+// `polygon` shape (see readSplineProfileParams/computeSplineProfile/
+// splineProfilePanelState below), so it gets rendering, selection, drag,
+// rotate, delete, save/load "for free" - only the panel wiring further down
+// (search "Vielkeilprofil tool wiring") is specific to it.
+//
+// Derivation summary (standard involute gear-tooth geometry): at radius r,
+// the tooth half-angle from the tooth centerline is
+//   psi(r) = halfAngle(pitch) + inv(alpha_pitch) - inv(alpha_r)
+// where inv(alpha) = tan(alpha) - alpha is the involute function and
+// alpha_r = acos(rb/r) is the pressure angle at r. Since t = tan(alpha_r)
+// parametrizes the curve above, inv(alpha_r) equals theta(t) := atan2(y(t),
+// x(t)) exactly, so a flank is built by sampling t and rotating each raw
+// point by a fixed offset that plants the pitch-radius point at the desired
+// half-angle. For an internal profile the same base-circle math applies, but
+// the *material* is the other side of the same curve - equivalent to
+// evaluating it at -t (which is just y -> -y), so `mirrorFactor` flips that
+// sign; this also flips which end of the flank (root or tip) sits closer to
+// the tooth's own centerline, so index 0 of every sampled flank is defined
+// to always be the "gap" (root) end and the last index the "own" (tip) end,
+// regardless of internal/external - see rGapEnd/rOwnEnd below.
+// ===========================================================================
+
+const SPLINE_PROFILE_FLANK_SAMPLES = 12; // involute samples per flank - enough resolution without excess points
+
+function involutePoint(rb, t) {
+  return { x: rb * (Math.cos(t) + t * Math.sin(t)), y: rb * (Math.sin(t) - t * Math.cos(t)) };
+}
+
+// Rotates a point around the origin by `angle` radians (distinct from the
+// existing rotatePoint(p, center, angleDeg) used elsewhere for whole-shape
+// rotation, which takes degrees and an arbitrary center).
+function rotateAroundOrigin(p, angle) {
+  const c = Math.cos(angle), s = Math.sin(angle);
+  return { x: p.x * c - p.y * s, y: p.x * s + p.y * c };
+}
+
+// Points strictly between angleFrom and angleTo (both excluded - callers
+// already have the endpoints as adjacent flank samples) along the circle of
+// radius `r` centered on the origin, swept in the (assumed CCW/increasing)
+// direction from angleFrom to angleTo. Same tessellation density convention
+// as filletCornerArc/arcBulgePoints above.
+function localArcPoints(r, angleFrom, angleTo) {
+  const sweep = angleTo - angleFrom;
+  const steps = Math.max(1, Math.round((Math.abs(sweep) / (Math.PI / 2)) * 8));
+  const pts = [];
+  for (let i = 1; i < steps; i++) {
+    const a = angleFrom + sweep * (i / steps);
+    pts.push({ x: r * Math.cos(a), y: r * Math.sin(a) });
+  }
+  return pts;
+}
+
+// Builds the closed, world-space outline of a parametric involute spline/gear
+// profile from `params` (see readSplineProfileParams for its fields), plus a
+// sparse filletRadii map for the optional root-fillet corners (consumed the
+// same way as any other polygon's - see getOutlinePoints/filletCornerArc).
+// On invalid input, `points` is null and `error` is a short user-facing
+// message - never returns NaN/Infinity coordinates or an obviously
+// self-intersecting flank.
+function computeSplineProfile(params) {
+  const fail = (msg) => ({ points: null, filletRadii: null, error: msg });
+
+  const z = Math.round(params.teeth);
+  const m = params.module;
+  if (!Number.isFinite(z) || z < 3) return fail('Zähnezahl muss eine ganze Zahl ≥ 3 sein.');
+  if (!Number.isFinite(m) || m <= 0) return fail('Modul muss größer als 0 sein.');
+  if (!Number.isFinite(params.pressureAngle) || params.pressureAngle < 1 || params.pressureAngle > 60) {
+    return fail('Eingriffswinkel muss zwischen 1° und 60° liegen.');
+  }
+  if (!Number.isFinite(params.centerX) || !Number.isFinite(params.centerY)) {
+    return fail('Mittelpunkt X/Y muss eine gültige Zahl sein.');
+  }
+  const alpha = (params.pressureAngle * Math.PI) / 180;
+  const x = Number.isFinite(params.profileShift) ? params.profileShift : 0;
+
+  const d = m * z;
+  const rPitch = d / 2;
+  const rb = rPitch * Math.cos(alpha);
+  if (!(rb > 1e-6)) return fail('Ungültiger Grundkreis (Eingriffswinkel prüfen).');
+
+  const isInternal = !!params.internal;
+  const tipDefault = isInternal ? rPitch - m * (1 - x) : rPitch + m * (1 + x);
+  const rootDefault = isInternal ? rPitch + m * (1.25 + x) : rPitch - m * (1.25 - x);
+  const rTip = params.tipDiameter ? params.tipDiameter / 2 : tipDefault;
+  const rRoot = params.rootDiameter ? params.rootDiameter / 2 : rootDefault;
+  if (!(rTip > 0) || !(rRoot > 0)) return fail('Kopfkreis und Fußkreis müssen größer als 0 sein.');
+
+  const rMin = isInternal ? rTip : rRoot;
+  const rMax = isInternal ? rRoot : rTip;
+  if (!(rMax > rMin + 1e-6)) return fail('Kopfkreis und Fußkreis ergeben kein gültiges Profil.');
+  if (!(rMin < rPitch - 1e-6 && rMax > rPitch + 1e-6)) {
+    return fail('Kopf-/Fußkreis passen nicht zum Teilkreis (Modul/Zähnezahl/Durchmesser prüfen).');
+  }
+  if (isInternal && rMin < rb - 1e-6) {
+    return fail('Kopfkreisdurchmesser liegt unterhalb des Grundkreises.');
+  }
+
+  // Tooth thickness at the pitch circle (arc length) - standard involute-gear formula.
+  const s = m * (Math.PI / 2 + 2 * x * Math.tan(alpha));
+  if (!(s > 0 && s < Math.PI * rPitch)) return fail('Profilverschiebung führt zu einer ungültigen Zahndicke.');
+  const halfAngPitch = s / (2 * rPitch);
+
+  const mirrorFactor = isInternal ? -1 : 1;
+  const tPitch = Math.sqrt(Math.max(0, (rPitch / rb) ** 2 - 1));
+  const pitchRaw = involutePoint(rb, tPitch);
+  const thetaPitchSigned = mirrorFactor * Math.atan2(pitchRaw.y, pitchRaw.x);
+  const rotationForRightFlank = -halfAngPitch - thetaPitchSigned;
+
+  // Sample the involute from the "gap" (root) end to the "own" (tip) end -
+  // see the file-header comment above for why index 0 is always the gap end.
+  const rGapEnd = isInternal ? rMax : rMin;
+  const rOwnEnd = isInternal ? rMin : rMax;
+  const tGapEnd = rGapEnd > rb ? Math.sqrt((rGapEnd / rb) ** 2 - 1) : 0;
+  const tOwnEnd = Math.sqrt(Math.max(0, (rOwnEnd / rb) ** 2 - 1));
+
+  const rawFlank = [];
+  // External profile whose root circle dips below the base circle: the
+  // involute doesn't exist down there, so connect with a straight radial
+  // segment instead (true manufacturing undercut curves are out of scope).
+  if (!isInternal && rMin < rb - 1e-6) rawFlank.push({ x: rMin, y: 0 });
+  for (let i = 0; i <= SPLINE_PROFILE_FLANK_SAMPLES; i++) {
+    const t = tGapEnd + (tOwnEnd - tGapEnd) * (i / SPLINE_PROFILE_FLANK_SAMPLES);
+    rawFlank.push(involutePoint(rb, t));
+  }
+
+  // Local (tooth-centered) frame: right flank first, left flank is its exact
+  // mirror about the tooth centerline (angle 0) - "Spiegelung der zweiten
+  // Zahnflanke", per spec.
+  const rightFlankLocal = rawFlank.map(rp => rotateAroundOrigin({ x: rp.x, y: mirrorFactor * rp.y }, rotationForRightFlank));
+  const leftFlankLocal = rightFlankLocal.map(p => ({ x: p.x, y: -p.y }));
+  const n = rightFlankLocal.length;
+
+  const angleRightOwn = Math.atan2(rightFlankLocal[n - 1].y, rightFlankLocal[n - 1].x);
+  const angleLeftOwn = Math.atan2(leftFlankLocal[n - 1].y, leftFlankLocal[n - 1].x);
+  const angleRightGap = Math.atan2(rightFlankLocal[0].y, rightFlankLocal[0].x);
+  const angleLeftGap = Math.atan2(leftFlankLocal[0].y, leftFlankLocal[0].x);
+  if (!(angleRightOwn < -1e-6)) {
+    return fail('Zahnkopf zu breit / Kopfkreis zu groß - Zahnflanken überschneiden sich.');
+  }
+  const pitchAngle = (2 * Math.PI) / z;
+  const gapSweep = (angleRightGap + pitchAngle) - angleLeftGap;
+  if (!(gapSweep > 1e-6)) {
+    return fail('Zähnezahl/Modul/Profilverschiebung führen zu sich überschneidenden Zahnflanken.');
+  }
+
+  const ownArcLocal = localArcPoints(rOwnEnd, angleRightOwn, angleLeftOwn);
+  const gapArcLocal = localArcPoints(rGapEnd, angleLeftGap, angleRightGap + pitchAngle);
+  const toothLocal = [...rightFlankLocal, ...ownArcLocal, ...leftFlankLocal.slice().reverse()];
+
+  const rotStart = ((params.rotation || 0) * Math.PI) / 180;
+  const points = [];
+  const filletRadii = {};
+  const rootFillet = Math.max(0, params.rootFillet || 0);
+
+  for (let k = 0; k < z; k++) {
+    const toothAngle = rotStart + k * pitchAngle;
+    const startIdx = points.length;
+    toothLocal.forEach(p => {
+      const rp = rotateAroundOrigin(p, toothAngle);
+      points.push({ x: rp.x + params.centerX, y: rp.y + params.centerY });
+    });
+    const endIdx = points.length - 1;
+    if (rootFillet > 0) {
+      filletRadii[startIdx] = rootFillet;
+      filletRadii[endIdx] = rootFillet;
+    }
+    gapArcLocal.forEach(p => {
+      const rp = rotateAroundOrigin(p, toothAngle);
+      points.push({ x: rp.x + params.centerX, y: rp.y + params.centerY });
+    });
+  }
+
+  if (points.length < 3 || points.some(p => !Number.isFinite(p.x) || !Number.isFinite(p.y))) {
+    return fail('Berechnung ergab keine gültige Geometrie (Parameter prüfen).');
+  }
+  return { points, filletRadii: Object.keys(filletRadii).length ? filletRadii : null, error: null };
 }
 
 // ===========================================================================
@@ -916,6 +1104,25 @@ function render() {
     drawLiveLabel(p.x, p.y - holeRadius - 12 / viewScale, 'X ' + p.x.toFixed(1) + '  Y ' + p.y.toFixed(1));
   }
 
+  // Vielkeilprofil tool preview: live involute-profile ghost outline at the
+  // placed center, recomputed from the panel's current values every frame -
+  // same "just re-derive it" approach as the rect/poly-N preview above.
+  if ((currentTool === 'splineprofile' && splineProfileCenter) || splineProfileEditId != null) {
+    const result = computeSplineProfile(readSplineProfileParams());
+    if (result.points) {
+      ctx.strokeStyle = '#4a9eff';
+      ctx.lineWidth = 2 / viewScale;
+      ctx.setLineDash([5 / viewScale, 3 / viewScale]);
+      ctx.beginPath();
+      ctx.moveTo(result.points[0].x, result.points[0].y);
+      for (let i = 1; i < result.points.length; i++) ctx.lineTo(result.points[i].x, result.points[i].y);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    if (splineProfileCenter) dot(splineProfileCenter, '#4a7dfc');
+  }
+
   ctx.restore();
 
   // Live X/Y read-out above the cursor, in screen space, whenever the mouse is
@@ -1302,6 +1509,8 @@ function setTool(tool) {
   document.getElementById('tool-' + tool).classList.add('active');
   document.getElementById('text-panel-block').style.display = (tool === 'text') ? 'block' : 'none';
   document.getElementById('holecircle-panel-block').style.display = (tool === 'holecircle') ? 'block' : 'none';
+  splineProfileEditId = null;
+  updateSplineProfilePanelVisibility();
   if (tool !== 'lineselect') selectedSegment = null;
   canvas.style.cursor = (tool === 'select' || tool === 'lineselect' || tool === 'dimension' || tool === 'point' || tool === 'centerpoint' || tool === 'edge' || tool === 'origin') ? 'pointer' : 'crosshair';
   updateToolShortcuts();
@@ -1324,6 +1533,7 @@ function cancelInProgress() {
   closePending = false;
   circleCenter = null;
   shapeStartPoint = null;
+  splineProfileCenter = null;
   refLineAngle = null;
   refLineSeg = null;
   angleLockActive = false;
@@ -2029,6 +2239,17 @@ canvas.addEventListener('click', (evt) => {
       onShapesChanged();
     }
     setTool('point');
+    return;
+  } else if (currentTool === 'splineprofile') {
+    // Click sets (or re-picks) the center - the shape itself is only created
+    // once the user confirms via the panel's "Profil erstellen" button, so
+    // parameters can still be tuned against the live preview first (see
+    // "Vielkeilprofil tool wiring" further down).
+    splineProfileCenter = snap(raw);
+    document.getElementById('splineprofile-center-x').value = splineProfileCenter.x;
+    document.getElementById('splineprofile-center-y').value = splineProfileCenter.y;
+    updateSplineProfileStatus();
+    render();
     return;
   } else if (currentTool === 'dimension') {
     const hit = hitTestSegment(raw);
@@ -2940,6 +3161,9 @@ function shapeLabel(s) {
   if (s.kind === 'holecircle') return 'Lochkreis-Loch';
   if (s.type === 'circle') return 'Kreis';
   if (s.kind === 'text') return `Text „${s.char}“`;
+  if (s.kind === 'splineprofile' && s.splineParams) {
+    return `Vielkeilprofil (${s.splineParams.internal ? 'innen' : 'außen'}, z=${s.splineParams.teeth}, m=${s.splineParams.module})`;
+  }
   const base = SHAPE_KIND_LABELS[s.kind] || 'Linienform';
   return s.open ? base + ' (offen)' : base;
 }
@@ -3074,6 +3298,14 @@ function renderShapeList() {
     addLabel.appendChild(addCheckbox);
     addLabel.appendChild(document.createTextNode(' Aufaddieren'));
     controls.appendChild(addLabel);
+
+    if (s.kind === 'splineprofile') {
+      const editBtn = document.createElement('button');
+      editBtn.textContent = '✏ Bearbeiten';
+      editBtn.title = 'Verzahnungsparameter dieses Profils nachträglich ändern';
+      editBtn.addEventListener('click', () => openSplineProfileEditor(s.id));
+      controls.appendChild(editBtn);
+    }
 
     const delBtn = document.createElement('button');
     delBtn.textContent = '✕';
@@ -3243,6 +3475,7 @@ document.getElementById('tool-poly6').addEventListener('click', () => setTool('p
 document.getElementById('tool-poly8').addEventListener('click', () => setTool('poly8'));
 document.getElementById('tool-text').addEventListener('click', () => setTool('text'));
 document.getElementById('tool-holecircle').addEventListener('click', () => setTool('holecircle'));
+document.getElementById('tool-splineprofile').addEventListener('click', () => setTool('splineprofile'));
 document.getElementById('tool-select').addEventListener('click', () => setTool('select'));
 document.getElementById('tool-lineselect').addEventListener('click', () => setTool('lineselect'));
 document.getElementById('tool-dimension').addEventListener('click', () => setTool('dimension'));
@@ -3253,6 +3486,169 @@ document.getElementById('tool-edge').addEventListener('click', () => setTool('ed
 document.getElementById('tool-edge3d').addEventListener('click', () => setTool('edge3d'));
 
 updateToolShortcuts(); // reflect the initial tool ('line') before any button is clicked
+
+// ===========================================================================
+// Vielkeilprofil tool wiring: the panel (index.html #splineprofile-panel-block)
+// doubles as both the "configure before placing" dialog (while currentTool
+// === 'splineprofile', see the mousedown/render branches above) and the
+// "edit an existing shape afterward" dialog (opened via the shape list's
+// "Bearbeiten" button, see renderShapeList above) - splineProfileEditId picks
+// which of the two modes is active and only changes what the primary button
+// does and what it's labelled, everything else (fields, live status,
+// quick-angle buttons) is shared.
+// ===========================================================================
+
+const splineProfileEls = {
+  internalBtn: document.getElementById('splineprofile-mode-internal'),
+  externalBtn: document.getElementById('splineprofile-mode-external'),
+  centerX: document.getElementById('splineprofile-center-x'),
+  centerY: document.getElementById('splineprofile-center-y'),
+  teeth: document.getElementById('splineprofile-teeth'),
+  module: document.getElementById('splineprofile-module'),
+  pressureAngle: document.getElementById('splineprofile-pressure-angle'),
+  rotation: document.getElementById('splineprofile-rotation'),
+  shift: document.getElementById('splineprofile-shift'),
+  tipDiameter: document.getElementById('splineprofile-tip-diameter'),
+  rootDiameter: document.getElementById('splineprofile-root-diameter'),
+  rootFillet: document.getElementById('splineprofile-root-fillet'),
+  status: document.getElementById('splineprofile-status'),
+  apply: document.getElementById('btn-splineprofile-apply'),
+  cancel: document.getElementById('btn-splineprofile-cancel'),
+  panel: document.getElementById('splineprofile-panel-block'),
+};
+
+// Reads the panel's current values into a plain params object (see
+// computeSplineProfile) - shared by the live preview and the apply handler
+// so they can never disagree about what "the current settings" mean.
+function readSplineProfileParams() {
+  return {
+    internal: splineProfileEls.internalBtn.classList.contains('active'),
+    centerX: parseFloat(splineProfileEls.centerX.value),
+    centerY: parseFloat(splineProfileEls.centerY.value),
+    teeth: parseFloat(splineProfileEls.teeth.value),
+    module: parseFloat(splineProfileEls.module.value),
+    pressureAngle: parseFloat(splineProfileEls.pressureAngle.value),
+    rotation: parseFloat(splineProfileEls.rotation.value) || 0,
+    profileShift: parseFloat(splineProfileEls.shift.value) || 0,
+    rootFillet: parseFloat(splineProfileEls.rootFillet.value) || 0,
+    tipDiameter: parseFloat(splineProfileEls.tipDiameter.value) || null,
+    rootDiameter: parseFloat(splineProfileEls.rootDiameter.value) || null,
+  };
+}
+
+function setSplineProfileMode(internal) {
+  splineProfileEls.externalBtn.classList.toggle('active', !internal);
+  splineProfileEls.internalBtn.classList.toggle('active', internal);
+  updateSplineProfileStatus();
+}
+splineProfileEls.externalBtn.addEventListener('click', () => setSplineProfileMode(false));
+splineProfileEls.internalBtn.addEventListener('click', () => setSplineProfileMode(true));
+
+document.getElementById('splineprofile-angle-30').addEventListener('click', () => { splineProfileEls.pressureAngle.value = '30'; updateSplineProfileStatus(); });
+document.getElementById('splineprofile-angle-375').addEventListener('click', () => { splineProfileEls.pressureAngle.value = '37.5'; updateSplineProfileStatus(); });
+document.getElementById('splineprofile-angle-45').addEventListener('click', () => { splineProfileEls.pressureAngle.value = '45'; updateSplineProfileStatus(); });
+
+// Re-validates the current panel values (without creating/changing anything)
+// and shows a short message if they don't currently produce a valid profile -
+// same idea as the in-canvas red-dashed error shape for a failed extrude,
+// but for the not-yet-committed Vielkeilprofil panel.
+function updateSplineProfileStatus() {
+  const result = computeSplineProfile(readSplineProfileParams());
+  splineProfileEls.status.textContent = result.error || '';
+  render();
+}
+[splineProfileEls.centerX, splineProfileEls.centerY, splineProfileEls.teeth, splineProfileEls.module,
+ splineProfileEls.pressureAngle, splineProfileEls.rotation, splineProfileEls.shift,
+ splineProfileEls.tipDiameter, splineProfileEls.rootDiameter, splineProfileEls.rootFillet]
+  .forEach(el => el.addEventListener('input', updateSplineProfileStatus));
+
+// Shown while actively placing a new profile (currentTool === 'splineprofile')
+// or editing an existing one (splineProfileEditId set) - see setTool() and
+// openSplineProfileEditor()/closeSplineProfileEditor() below.
+function updateSplineProfilePanelVisibility() {
+  // A shape can be deleted (or undone) while its editor is open - drop the
+  // stale reference instead of letting "Anwenden" silently do nothing/throw.
+  if (splineProfileEditId != null && !shapes.some(s => s.id === splineProfileEditId)) {
+    splineProfileEditId = null;
+  }
+  const show = currentTool === 'splineprofile' || splineProfileEditId != null;
+  splineProfileEls.panel.style.display = show ? 'block' : 'none';
+  if (!show) return;
+  const editing = splineProfileEditId != null;
+  splineProfileEls.apply.textContent = editing ? '✓ Änderungen übernehmen' : '✓ Profil erstellen';
+  splineProfileEls.cancel.textContent = editing ? '✕ Fertig' : '✕ Abbrechen';
+  updateSplineProfileStatus();
+}
+
+// Opens the panel bound to an existing 'splineprofile' shape, pre-filled from
+// its stored parameters (not re-derived from its baked points) - see the
+// shape's `splineParams` field, set in the apply handler below.
+function openSplineProfileEditor(shapeId) {
+  const shape = shapes.find(s => s.id === shapeId);
+  if (!shape || !shape.splineParams) return;
+  const p = shape.splineParams;
+  setSplineProfileMode(!!p.internal);
+  splineProfileEls.centerX.value = p.centerX;
+  splineProfileEls.centerY.value = p.centerY;
+  splineProfileEls.teeth.value = p.teeth;
+  splineProfileEls.module.value = p.module;
+  splineProfileEls.pressureAngle.value = p.pressureAngle;
+  splineProfileEls.rotation.value = p.rotation;
+  splineProfileEls.shift.value = p.profileShift;
+  splineProfileEls.rootFillet.value = p.rootFillet;
+  splineProfileEls.tipDiameter.value = p.tipDiameter || '';
+  splineProfileEls.rootDiameter.value = p.rootDiameter || '';
+  splineProfileEditId = shapeId;
+  updateSplineProfilePanelVisibility();
+}
+
+splineProfileEls.apply.addEventListener('click', () => {
+  const params = readSplineProfileParams();
+  const editing = splineProfileEditId != null;
+  if (!editing && !splineProfileCenter) {
+    splineProfileEls.status.textContent = 'Bitte zuerst einen Mittelpunkt in der Skizze anklicken.';
+    return;
+  }
+  const result = computeSplineProfile(params);
+  if (result.error) {
+    splineProfileEls.status.textContent = result.error;
+    return;
+  }
+  pushHistory();
+  if (editing) {
+    const shape = shapes.find(s => s.id === splineProfileEditId);
+    if (shape) {
+      shape.points = result.points;
+      if (result.filletRadii) shape.filletRadii = result.filletRadii; else delete shape.filletRadii;
+      shape.splineParams = params;
+    }
+    onShapesChanged();
+    updateSplineProfilePanelVisibility();
+  } else {
+    const newId = nextShapeId++;
+    shapes.push({
+      id: newId, type: 'polygon', kind: 'splineprofile',
+      points: result.points,
+      filletRadii: result.filletRadii || undefined,
+      splineParams: params,
+      isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: defaultAdditiveSide(), holeDepth: 5,
+    });
+    onShapesChanged();
+    splineProfileCenter = null;
+    setTool('select');
+    selectedShapeIds = new Set([newId]);
+    render();
+  }
+});
+
+splineProfileEls.cancel.addEventListener('click', () => {
+  if (splineProfileEditId != null) {
+    splineProfileEditId = null;
+    updateSplineProfilePanelVisibility();
+  } else {
+    setTool('select');
+  }
+});
 
 btnInsertBgImage.addEventListener('click', () => {
   bgImageInput.value = '';

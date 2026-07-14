@@ -89,6 +89,7 @@
           <button id="tool-poly8" class="tool" title="Achteck zeichnen: klicken für Mittelpunkt, klicken für Radius/Ausrichtung">⏣ 8-Eck</button>
           <button id="tool-text" class="tool" title="Text: rechts Schriftart/Größe/Breite einstellen, dann in die Skizze klicken (linker Rand der Grundlinie)">🔤 Text</button>
           <button id="tool-holecircle" class="tool" title="Lochkreis: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken">◎ Lochkreis</button>
+          <button id="tool-splineprofile" class="tool" title="Vielkeilprofil (Evolventenverzahnung): Mittelpunkt anklicken, dann rechts die Profilparameter einstellen und mit „Profil erstellen“ übernehmen">⚙ Vielkeilprofil</button>
         </div>
       </div>
     </div>
@@ -111,7 +112,7 @@
         <span id="face-edit-label">Formen auf dieser Fläche: „Aufaddieren“ = Erhebung, „Loch“ = Ausschnitt (echtes Boolean-Schneiden). Die 3D-Vorschau aktualisiert sich live - mit „✓ Übernehmen“ bestätigen.</span>
         <button id="btn-cancel-face-edit">✕ Abbrechen</button>
       </div>
-      <div id="sketch-hint">Linien-Tool: Punkte anklicken, mit Doppelklick oder Enter schließen. Alt+Klick auf eine bestehende Linie: als Referenzlinie übernehmen (nächstes Segment richtet sich an deren Winkel aus). Strg gedrückt halten: aktuellen Winkel fixieren, Länge kann an anderen Linien einschnappen oder sich mit einem beliebigen anderen Punkt (z.B. dem Startpunkt) auf gleiche Höhe/Breite ausrichten, unabhängig vom Snap-Raster. Umschalt (Shift) beim Setzen des Endpunkts gedrückt halten: biegt das gerade gesetzte Segment zu einem Bogen, Stärke/Richtung folgt der Maus - loslassen übernimmt die Biegung, weiter normal klicken (ohne Shift) für gerade Segmente (beliebig mischbar). Nachträglich lässt sich ein bereits gesetztes Segment so nicht mehr biegen. Kreis-Tool: Klick = Mittelpunkt, dann ziehen und klicken = Radius. Rechteck-Tool: Klick = erste Ecke, Klick = gegenüberliegende Ecke. Vieleck-Tools (3/5/6/8-Eck): Klick = Mittelpunkt, dann ziehen und klicken = Radius und Ausrichtung. Text-Tool: rechts Einstellungen wählen, dann klicken = linker Rand der Grundlinie. Lochkreis-Tool: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken - wechselt danach automatisch ins Punkte-Tool zur Feinjustierung. Vor dem Übernehmen für jede Form im Formen-Optionsmenü „Loch“ oder „Aufaddieren“ sowie die eigene Höhe/Tiefe wählen. Auswahl-Tool: Strg+Klick fügt eine Form der Auswahl hinzu/entfernt sie, mehrere ausgewählte Formen lassen sich gemeinsam verschieben. R+Klick+Ziehen auf eine Form dreht sie stattdessen um ihren Mittelpunkt (Mittelpunkt-Tool, falls verschoben) - der Drehwinkel rastet dabei auf das Winkel-Raster ein (falls aktiv).Punkte-Tool: Eckpunkt oder Mittelpunkt anklicken, um die Koordinaten zu bearbeiten, oder anklicken und ziehen, um ihn direkt zu verschieben (rastet auf dem Snap-Raster ein). 2D Ecken abrunden-Tool (⌒): Linie einer Linienform nahe einer Ecke anklicken, um dort einen Rundungsradius einzugeben (0 oder leer = scharfe Ecke). Mausrad: Zoom. Mittlere Maustaste ziehen: Ansicht verschieben.</div>
+      <div id="sketch-hint">Linien-Tool: Punkte anklicken, mit Doppelklick oder Enter schließen. Alt+Klick auf eine bestehende Linie: als Referenzlinie übernehmen (nächstes Segment richtet sich an deren Winkel aus). Strg gedrückt halten: aktuellen Winkel fixieren, Länge kann an anderen Linien einschnappen oder sich mit einem beliebigen anderen Punkt (z.B. dem Startpunkt) auf gleiche Höhe/Breite ausrichten, unabhängig vom Snap-Raster. Umschalt (Shift) beim Setzen des Endpunkts gedrückt halten: biegt das gerade gesetzte Segment zu einem Bogen, Stärke/Richtung folgt der Maus - loslassen übernimmt die Biegung, weiter normal klicken (ohne Shift) für gerade Segmente (beliebig mischbar). Nachträglich lässt sich ein bereits gesetztes Segment so nicht mehr biegen. Kreis-Tool: Klick = Mittelpunkt, dann ziehen und klicken = Radius. Rechteck-Tool: Klick = erste Ecke, Klick = gegenüberliegende Ecke. Vieleck-Tools (3/5/6/8-Eck): Klick = Mittelpunkt, dann ziehen und klicken = Radius und Ausrichtung. Text-Tool: rechts Einstellungen wählen, dann klicken = linker Rand der Grundlinie. Lochkreis-Tool: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken - wechselt danach automatisch ins Punkte-Tool zur Feinjustierung. Vielkeilprofil-Tool: Mittelpunkt anklicken, rechts die Verzahnungsparameter einstellen (Live-Vorschau) und mit „Profil erstellen“ übernehmen - danach über „Bearbeiten“ in der Formen-Liste jederzeit mit neuen Parametern neu berechnen. Vor dem Übernehmen für jede Form im Formen-Optionsmenü „Loch“ oder „Aufaddieren“ sowie die eigene Höhe/Tiefe wählen. Auswahl-Tool: Strg+Klick fügt eine Form der Auswahl hinzu/entfernt sie, mehrere ausgewählte Formen lassen sich gemeinsam verschieben. R+Klick+Ziehen auf eine Form dreht sie stattdessen um ihren Mittelpunkt (Mittelpunkt-Tool, falls verschoben) - der Drehwinkel rastet dabei auf das Winkel-Raster ein (falls aktiv).Punkte-Tool: Eckpunkt oder Mittelpunkt anklicken, um die Koordinaten zu bearbeiten, oder anklicken und ziehen, um ihn direkt zu verschieben (rastet auf dem Snap-Raster ein). 2D Ecken abrunden-Tool (⌒): Linie einer Linienform nahe einer Ecke anklicken, um dort einen Rundungsradius einzugeben (0 oder leer = scharfe Ecke). Mausrad: Zoom. Mittlere Maustaste ziehen: Ansicht verschieben.</div>
     </div>
 
     <div id="side-panel">
@@ -164,6 +165,53 @@
         <label>Lochdurchmesser (mm)
           <input type="number" id="holecircle-diameter" value="5" min="0.1" step="0.5">
         </label>
+      </div>
+      <div class="panel-block" id="splineprofile-panel-block" style="display:none">
+        <h3>Vielkeilprofil (Evolventenverzahnung)</h3>
+        <div class="button-row">
+          <button type="button" id="splineprofile-mode-external" class="side-btn active">Außenverzahnung</button>
+          <button type="button" id="splineprofile-mode-internal" class="side-btn">Innenverzahnung</button>
+        </div>
+        <label>Mittelpunkt X (mm)
+          <input type="number" id="splineprofile-center-x" value="0" step="1">
+        </label>
+        <label>Mittelpunkt Y (mm)
+          <input type="number" id="splineprofile-center-y" value="0" step="1">
+        </label>
+        <label>Zähnezahl
+          <input type="number" id="splineprofile-teeth" value="20" min="3" step="1">
+        </label>
+        <label>Modul (mm)
+          <input type="number" id="splineprofile-module" value="2" min="0.01" step="0.1">
+        </label>
+        <label>Eingriffswinkel (°)
+          <input type="number" id="splineprofile-pressure-angle" value="20" min="1" max="60" step="0.5">
+        </label>
+        <div class="button-row">
+          <button type="button" id="splineprofile-angle-30" class="side-btn">30°</button>
+          <button type="button" id="splineprofile-angle-375" class="side-btn">37,5°</button>
+          <button type="button" id="splineprofile-angle-45" class="side-btn">45°</button>
+        </div>
+        <label title="Startwinkel des ersten Zahns, gegen den Uhrzeigersinn">Drehwinkel / Startwinkel (°)
+          <input type="number" id="splineprofile-rotation" value="0" step="1">
+        </label>
+        <label title="Profilverschiebungsfaktor x - 0 = kein Versatz">Profilverschiebung (x)
+          <input type="number" id="splineprofile-shift" value="0" step="0.05">
+        </label>
+        <label title="Leer/0 = automatisch aus Modul/Zähnezahl/Profilverschiebung berechnet">Kopfkreisdurchmesser (mm)
+          <input type="number" id="splineprofile-tip-diameter" value="" step="0.1" placeholder="automatisch">
+        </label>
+        <label title="Leer/0 = automatisch aus Modul/Zähnezahl/Profilverschiebung berechnet">Fußkreisdurchmesser (mm)
+          <input type="number" id="splineprofile-root-diameter" value="" step="0.1" placeholder="automatisch">
+        </label>
+        <label title="Rundung am Zahnfuß - 0 = scharfe Kante">Fußradius (mm, optional)
+          <input type="number" id="splineprofile-root-fillet" value="0" min="0" step="0.05">
+        </label>
+        <div id="splineprofile-status" style="font-size:11px; color:#e06060; min-height:14px;"></div>
+        <div style="display:flex; gap:6px; margin-top:4px;">
+          <button type="button" id="btn-splineprofile-apply" class="primary" style="width:auto; flex:1; margin-top:0;">✓ Profil erstellen</button>
+          <button type="button" id="btn-splineprofile-cancel" style="flex:1;">✕ Abbrechen</button>
+        </div>
       </div>
       <div class="panel-block" id="extrude-panel-block">
         <h3>Extrusion</h3>
