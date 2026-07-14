@@ -24,6 +24,8 @@ let circleCenter = null;  // in-progress circle center
 let shapeStartPoint = null; // in-progress rect/regular-polygon tool: first click (corner or center)
 let mousePos = null;      // current mouse position (canvas space), for previews
 let selectedShapeIds = new Set(); // Ctrl/Cmd-click adds/removes a shape in the 'select' tool, for multi-drag/multi-edit
+let selectedSegment = null; // 'lineselect' tool: {shapeId, segIndex} of the currently picked edge, or null - Delete opens the shape at that edge
+let reopenedShape = null;   // an open (shape.open) polygon lifted into drawingPoints for re-closing with the line tool - its props/points, restored on cancel, reapplied on finishPolygon
 let errorShapeId = null;  // shape blamed for the most recent failed extrude (see buildBaseGroup/rebuildSolid) - drawn in red until the next extrude attempt
 let extrudedGroup = null; // THREE.Group currently in the viewer, exportable
 // True once the current sketch state has been explicitly confirmed via
@@ -43,6 +45,8 @@ let history = [];         // stack of previous `shapes` snapshots, for undo
 let dragState = null;     // active shape-drag: {shapeId, original, startRaw, dx, dy, moved}
 let pointDragState = null; // active point-tool drag: {hit, startRaw, moved, orig} - see updatePointDrag()
 let pivotDragState = null; // active center-point-tool drag: {hit, startRaw, moved, orig} - see updatePivotDrag()
+let rKeyDown = false;      // R held down - modifies the select-tool drag below into a rotate
+let rotateDragState = null; // active R+drag rotate (select tool): {shapeIds, pivot, originals, startAngle, moved} - see updateRotateDrag()
 let backgroundImages = []; // reference images for the CURRENT sketch (base, or the active face feature) -
                             // {id, dataUrl (base64, persisted), el (loaded HTMLImageElement, NOT persisted),
                             //  x1,y1,x2,y2 (two diagonal world-space corners, order-independent)} - purely a
@@ -72,6 +76,7 @@ let angleLockAlignFrom = null; // world point the current snap hit is axis-align
 let faceFeatures = [];
 let nextFeatureId = 1;
 let faceSelectMode = false;  // waiting for a click on the 3D model to pick a face
+let faceSelectPurpose = 'edit'; // what a picked face does: 'edit' (sketch on it) or 'exportDxf' (export its outline)
 // while sketching a face feature: {featureId|null (null = new), basis, boundaryLoopUV,
 // innerLoopsUV, modelReferenceUV, baseShapes, baseHistory} - baseShapes/baseHistory are
 // the stashed base sketch's `shapes`/`history`, restored on exit
@@ -173,6 +178,8 @@ const shapeListEl = document.getElementById('shape-list');
 const extrudeStatusEl = document.getElementById('extrude-status');
 const btnExtrude = document.getElementById('btn-extrude');
 const btnExport = document.getElementById('btn-export');
+const btnExportStep = document.getElementById('btn-export-step');
+const btnExportDxf = document.getElementById('btn-export-dxf');
 const btnUndo = document.getElementById('btn-undo');
 const btnClear = document.getElementById('btn-clear');
 const btnSaveProject = document.getElementById('btn-save-project');
@@ -734,6 +741,8 @@ function render() {
   if (currentTool === 'centerpoint') drawCenterPivotHandles();
   if (currentTool === 'edge') drawEdgeHandles();
   if (currentTool === 'select') drawBackgroundImageHandles();
+  if (currentTool === 'lineselect') drawLineSelectHandles();
+  if (currentTool === 'line' || currentTool === 'lineselect') drawOpenShapeEnds();
   drawDragLabel();
 
   // reference line selected via Alt-click, while drawing
@@ -1001,13 +1010,20 @@ function drawShape(shape, selected, isError) {
     const pts = getOutlinePoints(shape);
     ctx.moveTo(pts[0].x, pts[0].y);
     for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-    ctx.closePath();
+    // An open shape (a line was deleted with the "Linie auswählen" tool) is a
+    // polyline with a gap between its last and first point, not a closed
+    // region - draw it dashed and don't close/fill it, so the missing edge and
+    // its two open ends read clearly as "needs re-closing".
+    if (!shape.open) ctx.closePath();
   } else {
     ctx.arc(shape.center.x, shape.center.y, shape.radius, 0, Math.PI * 2);
   }
+  if (shape.open) ctx.setLineDash([6 / viewScale, 4 / viewScale]);
   ctx.stroke();
-  ctx.fillStyle = color + '22';
-  ctx.fill();
+  if (!shape.open) {
+    ctx.fillStyle = color + '22';
+    ctx.fill();
+  }
   ctx.restore();
 }
 
@@ -1137,6 +1153,37 @@ function drawEdgeHandles() {
   });
 }
 
+// "Linie auswählen" tool: draws a thick highlight over the currently picked
+// edge (selectedSegment), so it's clear which line Delete/Backspace will remove.
+function drawLineSelectHandles() {
+  if (!selectedSegment) return;
+  const s = shapes.find(sh => sh.id === selectedSegment.shapeId);
+  if (!s || s.type !== 'polygon') return;
+  const n = s.points.length;
+  const a = s.points[selectedSegment.segIndex];
+  const b = s.points[(selectedSegment.segIndex + 1) % n];
+  ctx.save();
+  ctx.strokeStyle = '#ff5f5f';
+  ctx.lineWidth = 4 / viewScale;
+  const bulge = s.curveBulges && s.curveBulges[selectedSegment.segIndex];
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  if (bulge) arcBulgePoints(a, b, bulge).forEach(p => ctx.lineTo(p.x, p.y));
+  else ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Marks the two open ends of every open shape (see drawShape) with a dot, so
+// the user can see where to click with the line tool to continue/re-close them.
+function drawOpenShapeEnds() {
+  shapes.forEach(s => {
+    if (!s.open || s.type !== 'polygon' || s.points.length < 2) return;
+    dot(s.points[0], '#ffcc55', 6);
+    dot(s.points[s.points.length - 1], '#ffcc55', 6);
+  });
+}
+
 // Live dimension readout while a shape is being dragged out (line length, circle
 // radius, rect size, polygon radius) - sets up the font/alignment drawLabelBg
 // expects, so callers can just pass a position and the text to show.
@@ -1200,7 +1247,16 @@ const TOOL_SHORTCUTS = {
   poly8: [['Klick', 'Mittelpunkt setzen'], ['Ziehen + Klick', 'Radius und Ausrichtung festlegen']],
   text: [['Rechts', 'Schriftart/Größe/Höhe einstellen'], ['Klick', 'Linker Rand der Grundlinie']],
   holecircle: [['Rechts', 'Radius/Anzahl/Durchmesser einstellen'], ['Klick', 'Mittelpunkt setzen (wechselt danach ins Punkte-Tool)']],
-  select: [['Klick', 'Form auswählen/verschieben'], ['Strg + Klick', 'Weitere Form zur Auswahl hinzufügen/entfernen']],
+  select: [
+    ['Klick', 'Form auswählen/verschieben'],
+    ['Strg + Klick', 'Weitere Form zur Auswahl hinzufügen/entfernen'],
+    ['R + Klick + Ziehen', 'Form um ihren Mittelpunkt drehen (Winkel rastet auf das Winkel-Raster ein)'],
+  ],
+  lineselect: [
+    ['Klick', 'Einzelne Linie einer Linienform auswählen'],
+    ['Entf / Backspace', 'Gewählte Linie löschen - die Form wird dort geöffnet'],
+    ['Linien-Werkzeug', 'Offene Form am Endpunkt anklicken und wieder verschließen'],
+  ],
   dimension: [['Klick', 'Linie, Kreis oder gebogene Linie anklicken, Länge/Radius eingeben']],
   origin: [['Klick', 'Eckpunkt oder Mittelpunkt als neuen Ursprung setzen']],
   point: [
@@ -1235,6 +1291,7 @@ function setTool(tool) {
   closePivotEditor(true);
   endDrag();
   endBgImageDrag();
+  endRotateDrag();
   if (tool !== 'edge3d') {
     closeEdgeFilletEditor(true);
     clearHoverEdgeHighlight();
@@ -1245,12 +1302,21 @@ function setTool(tool) {
   document.getElementById('tool-' + tool).classList.add('active');
   document.getElementById('text-panel-block').style.display = (tool === 'text') ? 'block' : 'none';
   document.getElementById('holecircle-panel-block').style.display = (tool === 'holecircle') ? 'block' : 'none';
-  canvas.style.cursor = (tool === 'select' || tool === 'dimension' || tool === 'point' || tool === 'centerpoint' || tool === 'edge' || tool === 'origin') ? 'pointer' : 'crosshair';
+  if (tool !== 'lineselect') selectedSegment = null;
+  canvas.style.cursor = (tool === 'select' || tool === 'lineselect' || tool === 'dimension' || tool === 'point' || tool === 'centerpoint' || tool === 'edge' || tool === 'origin') ? 'pointer' : 'crosshair';
   updateToolShortcuts();
   render();
 }
 
 function cancelInProgress() {
+  // If a line was lifted out of an open shape to re-close it (see line-tool
+  // adoption below) but the drawing was abandoned, put that open shape back
+  // exactly as it was rather than silently losing it.
+  if (reopenedShape) {
+    shapes.push(reopenedShape);
+    reopenedShape = null;
+    onShapesChanged();
+  }
   drawingPoints = [];
   drawingBulges = {};
   curveBulgeActive = false;
@@ -1282,10 +1348,36 @@ function defaultAdditiveSide() {
 
 function finishPolygon() {
   if (drawingPoints.length >= 3) {
-    pushHistory();
     const shape = { id: nextShapeId++, type: 'polygon', points: drawingPoints.slice(), isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: defaultAdditiveSide(), holeDepth: 5 };
     if (Object.keys(drawingBulges).length > 0) shape.curveBulges = { ...drawingBulges };
+    // Re-closing a shape that was opened with the "Linie auswählen" tool: carry
+    // over its extrude settings/kind/group so it comes back as the same solid,
+    // just with a re-drawn edge (see reopenedShape adoption in the line tool).
+    if (reopenedShape) {
+      // The open shape was lifted out of `shapes` during adoption; put it back
+      // just long enough to snapshot it, so Undo returns to the open state the
+      // user was editing rather than a transient "shape briefly gone" state.
+      shapes.push(reopenedShape);
+      pushHistory();
+      shapes.pop();
+      shape.isHole = reopenedShape.isHole;
+      shape.isAdditive = reopenedShape.isAdditive;
+      shape.additiveHeight = reopenedShape.additiveHeight;
+      shape.additiveSide = reopenedShape.additiveSide;
+      shape.holeDepth = reopenedShape.holeDepth;
+      if (reopenedShape.groupId != null) shape.groupId = reopenedShape.groupId;
+      if (reopenedShape.kind) shape.kind = reopenedShape.kind;
+      reopenedShape = null;
+    } else {
+      pushHistory();
+    }
     shapes.push(shape);
+    onShapesChanged();
+  } else if (reopenedShape) {
+    // Bailed out before the re-closing had enough points to form a shape -
+    // restore the open shape instead of dropping it.
+    shapes.push(reopenedShape);
+    reopenedShape = null;
     onShapesChanged();
   }
   drawingPoints = [];
@@ -1300,6 +1392,55 @@ function finishPolygon() {
   angleLockSnapHit = null;
   angleLockAlignFrom = null;
   render();
+}
+
+// "Linie auswählen" tool + Delete: removes edge `segIndex` of a closed polygon,
+// turning it into an open polyline (shape.open) with a gap where that edge was.
+// The vertices are re-ordered so the gap sits between the last and first point;
+// both endpoints are kept so the line tool can later re-close it (adoptOpenShapeEnd).
+function openShapeAtSegment(shapeId, segIndex) {
+  const s = shapes.find(sh => sh.id === shapeId);
+  if (!s || s.type !== 'polygon' || s.open) return;
+  const n = s.points.length;
+  if (n < 3) return;
+  pushHistory();
+  const start = (segIndex + 1) % n;
+  const reordered = [];
+  for (let k = 0; k < n; k++) reordered.push(s.points[(start + k) % n]);
+  s.points = reordered;
+  s.open = true;
+  // filletRadii/curveBulges are keyed by the pre-reorder edge indices and one
+  // edge is now gone, so that mapping no longer holds - drop them rather than
+  // leave rounds/bends attached to the wrong edges.
+  delete s.filletRadii;
+  delete s.curveBulges;
+  onShapesChanged();
+}
+
+// Line tool: if `raw` lands on an open shape's endpoint, lift that polyline into
+// drawingPoints so the user can continue it and click the far end to re-close it
+// (finishPolygon then restores the shape's extrude settings). The clicked end
+// becomes the free drawing end; the other open end becomes the close target
+// (drawingPoints[0]). Returns true if a shape was adopted.
+function adoptOpenShapeEnd(raw) {
+  const threshold = POINT_HIT_PX / viewScale;
+  for (let i = shapes.length - 1; i >= 0; i--) {
+    const s = shapes[i];
+    if (!s.open || s.type !== 'polygon' || s.points.length < 2) continue;
+    const last = s.points.length - 1;
+    const dStart = dist(raw, s.points[0]);
+    const dEnd = dist(raw, s.points[last]);
+    if (dStart > threshold && dEnd > threshold) continue;
+    const fromEnd = dEnd <= dStart; // clicked (or nearer) the last point?
+    const pts = s.points.map(p => ({ x: p.x, y: p.y }));
+    drawingPoints = fromEnd ? pts : pts.reverse();
+    drawingBulges = {};
+    reopenedShape = s;
+    shapes.splice(i, 1);
+    onShapesChanged();
+    return true;
+  }
+  return false;
 }
 
 // Finalizes whatever edge is currently being bent (Shift-drag) - shared by releasing
@@ -1330,6 +1471,7 @@ function commitCurveBulge() {
 // called separately, once, from onShapesChanged() when the edit completes.
 function markDirty() {
   btnExport.disabled = true;
+  btnExportStep.disabled = true;
   extrudeStatusEl.textContent = '';
   currentSolidForPicking = null;
   modelCommitted = false;
@@ -1348,6 +1490,7 @@ canvas.addEventListener('mousemove', (evt) => {
   if (bgImageDragState) updateBgImageDrag(mousePos);
   if (pointDragState) updatePointDrag(mousePos);
   if (pivotDragState) updatePivotDrag(mousePos);
+  if (rotateDragState) updateRotateDrag(mousePos);
   if (curveBulgeActive && curveBulgeEdgeIndex !== null) {
     const a = drawingPoints[curveBulgeEdgeIndex], b = bulgeEdgeEndpoint(curveBulgeEdgeIndex);
     const bulge = bulgeFromMouse(a, b, mousePos);
@@ -1427,7 +1570,7 @@ canvas.addEventListener('mousedown', (evt) => {
   if (currentTool !== 'select' || evt.button !== 0) return;
   const raw = getMousePos(evt);
 
-  if (!evt.ctrlKey && !evt.metaKey) {
+  if (!evt.ctrlKey && !evt.metaKey && !rKeyDown) {
     // Dragging a handle of the currently selected background image takes
     // priority over shape hit-testing, so handles stay grabbable even where
     // they overlap a shape underneath.
@@ -1441,6 +1584,26 @@ canvas.addEventListener('mousedown', (evt) => {
   }
 
   const hit = hitTestShape(raw);
+
+  if (rKeyDown) {
+    // R + Klick: rotate the clicked shape (plus its group-mates, e.g. a
+    // hole-circle pattern or placed text) around its center point marker,
+    // instead of moving it. Doesn't touch the current selection.
+    if (!hit) return;
+    const rotateIds = new Set([hit.id]);
+    if (hit.groupId != null) shapes.filter(sh => sh.groupId === hit.groupId).forEach(sh => rotateIds.add(sh.id));
+    const idsArr = Array.from(rotateIds);
+    const pivot = hit.groupId != null ? groupPivotOf(hit.groupId) : effectivePivot(hit);
+    rotateDragState = {
+      shapeIds: idsArr,
+      pivot,
+      originals: idsArr.map(id => JSON.parse(JSON.stringify(shapes.find(s => s.id === id)))),
+      startAngle: Math.atan2(raw.y - pivot.y, raw.x - pivot.x),
+      moved: false,
+    };
+    canvas.style.cursor = 'grabbing';
+    return;
+  }
 
   if (evt.ctrlKey || evt.metaKey) {
     // Ctrl/Cmd-click toggles one shape's membership in the selection without
@@ -1528,6 +1691,41 @@ function endDrag() {
   if (!dragState) return;
   if (dragState.moved) onShapesChanged();
   dragState = null;
+  canvas.style.cursor = 'pointer';
+  render();
+}
+
+// R+drag rotate (Objekt-tool): angle is the total swing from the pivot->startRaw
+// ray to the pivot->current-mouse ray, applied fresh to the snapshot each move
+// (same re-derive-from-originals approach as updateDrag(), so it can't drift).
+function updateRotateDrag(raw) {
+  const { pivot, startAngle } = rotateDragState;
+  const angleNow = Math.atan2(raw.y - pivot.y, raw.x - pivot.x);
+  let deltaDeg = ((angleNow - startAngle) * 180) / Math.PI;
+  if (angleOnInput.checked) {
+    const stepDeg = Math.max(1, parseFloat(angleStepInput.value) || 45);
+    deltaDeg = Math.round(deltaDeg / stepDeg) * stepDeg;
+  }
+  if (!deltaDeg) return;
+  if (!rotateDragState.moved) {
+    pushHistory(); // snapshot taken once, right before the shape actually starts rotating
+    rotateDragState.moved = true;
+  }
+  rotateDragState.shapeIds.forEach((id, idx) => {
+    const shape = shapes.find(s => s.id === id);
+    if (!shape) return;
+    const orig = rotateDragState.originals[idx];
+    if (orig.type === 'circle') shape.center = { ...orig.center };
+    else shape.points = orig.points.map(p => ({ ...p }));
+    rotateShapeAround(shape, pivot, deltaDeg);
+  });
+  markDirty();
+}
+
+function endRotateDrag() {
+  if (!rotateDragState) return;
+  if (rotateDragState.moved) onShapesChanged();
+  rotateDragState = null;
   canvas.style.cursor = 'pointer';
   render();
 }
@@ -1678,7 +1876,7 @@ function endBgImageDrag() {
   render();
 }
 
-window.addEventListener('mouseup', () => { endDrag(); endBgImageDrag(); endPan(); endPointDrag(); endPivotDrag(); });
+window.addEventListener('mouseup', () => { endDrag(); endBgImageDrag(); endPan(); endPointDrag(); endPivotDrag(); endRotateDrag(); });
 
 canvas.addEventListener('click', (evt) => {
   const raw = getMousePos(evt);
@@ -1710,6 +1908,13 @@ canvas.addEventListener('click', (evt) => {
       // a click while still bending an edge ends the bend (same as releasing Shift)
       // instead of also placing a new point wherever the click happened to land
       commitCurveBulge();
+      return;
+    }
+    // Not drawing yet: clicking an open shape's endpoint (one left behind by the
+    // "Linie auswählen" tool, see adoptOpenShapeEnd) picks up that polyline to
+    // continue/re-close it instead of starting a brand-new shape.
+    if (drawingPoints.length === 0 && adoptOpenShapeEnd(raw)) {
+      render();
       return;
     }
     if (drawingPoints.length >= 3 && dist(raw, drawingPoints[0]) <= CLOSE_SNAP_PX / viewScale) {
@@ -1846,6 +2051,17 @@ canvas.addEventListener('click', (evt) => {
     } else {
       closeFilletEditor(true);
     }
+  } else if (currentTool === 'lineselect') {
+    // Pick a single edge of a (still closed) line shape. The phantom closing
+    // edge of an already-open shape isn't a real line, and deleting a second
+    // edge would split the outline in two, so only closed polygons qualify.
+    const hit = hitTestSegment(raw);
+    if (hit && hit.shape.type === 'polygon' && hit.segIndex !== null && !hit.shape.open) {
+      selectedSegment = { shapeId: hit.shape.id, segIndex: hit.segIndex };
+    } else {
+      selectedSegment = null;
+    }
+    render();
   }
 });
 
@@ -1869,6 +2085,14 @@ document.addEventListener('keydown', (evt) => {
     evt.preventDefault();
     deleteBgImage(selectedBgImageId);
   }
+  if ((evt.key === 'Delete' || evt.key === 'Backspace') && currentTool === 'lineselect' && selectedSegment) {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return; // don't hijack text editing
+    evt.preventDefault();
+    openShapeAtSegment(selectedSegment.shapeId, selectedSegment.segIndex);
+    selectedSegment = null;
+    render();
+  }
   // Ctrl held while drawing a line: lock the segment's current angle so only its length
   // still follows the mouse, snapping onto other lines to determine that length.
   if (evt.key === 'Control' && currentTool === 'line' && drawingPoints.length > 0 && !angleLockActive && mousePos) {
@@ -1877,6 +2101,13 @@ document.addEventListener('keydown', (evt) => {
     angleLockAngle = Math.atan2(current.y - from.y, current.x - from.x);
     angleLockActive = true;
     render();
+  }
+  // R held in the Objekt-tool: turns the next click+drag on a shape into a rotate
+  // around its center point instead of a move - see the mousedown handler below.
+  if (evt.key.toLowerCase() === 'r' && !rKeyDown) {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return; // don't hijack text editing
+    rKeyDown = true;
   }
 });
 
@@ -1888,6 +2119,7 @@ document.addEventListener('keyup', (evt) => {
     angleLockAlignFrom = null;
     render();
   }
+  if (evt.key.toLowerCase() === 'r') rKeyDown = false;
   if (evt.key === 'Shift' && curveBulgeActive) commitCurveBulge();
 });
 
@@ -2708,7 +2940,8 @@ function shapeLabel(s) {
   if (s.kind === 'holecircle') return 'Lochkreis-Loch';
   if (s.type === 'circle') return 'Kreis';
   if (s.kind === 'text') return `Text „${s.char}“`;
-  return SHAPE_KIND_LABELS[s.kind] || 'Linienform';
+  const base = SHAPE_KIND_LABELS[s.kind] || 'Linienform';
+  return s.open ? base + ' (offen)' : base;
 }
 
 function centroidOf(shape) {
@@ -2775,6 +3008,7 @@ function shapesInGroup(s) {
 }
 
 function renderShapeList() {
+  btnExportDxf.disabled = shapes.length === 0;
   shapeListEl.innerHTML = '';
   if (shapes.length === 0) {
     shapeListEl.innerHTML = '<div class="empty">Noch keine Formen gezeichnet.</div>';
@@ -3010,6 +3244,7 @@ document.getElementById('tool-poly8').addEventListener('click', () => setTool('p
 document.getElementById('tool-text').addEventListener('click', () => setTool('text'));
 document.getElementById('tool-holecircle').addEventListener('click', () => setTool('holecircle'));
 document.getElementById('tool-select').addEventListener('click', () => setTool('select'));
+document.getElementById('tool-lineselect').addEventListener('click', () => setTool('lineselect'));
 document.getElementById('tool-dimension').addEventListener('click', () => setTool('dimension'));
 document.getElementById('tool-origin').addEventListener('click', () => setTool('origin'));
 document.getElementById('tool-point').addEventListener('click', () => setTool('point'));
@@ -3078,6 +3313,7 @@ function doClearSketch() {
   closeEdgeFilletEditor(false);
   endDrag();
   endBgImageDrag();
+  endRotateDrag();
   faceSelectMode = false;
   faceEditContext = null;
   baseRollback = false;
@@ -3110,6 +3346,7 @@ function doClearSketch() {
   }
   currentSolidForPicking = null;
   btnExport.disabled = true;
+  btnExportStep.disabled = true;
   extrudeStatusEl.textContent = '';
 
   renderShapeList();
@@ -3299,8 +3536,11 @@ function replicadSidedSolid(shape, h, side) {
 // Pure geometry construction, no scene/DOM side effects. Returns null if
 // there's nothing to extrude.
 function buildBaseGroup() {
-  const additives = shapes.filter(s => s.isAdditive);
-  const holes = shapes.filter(s => s.isHole);
+  // Open shapes (a line was deleted with "Linie auswählen" and not yet
+  // re-closed) aren't closed regions, so they can't be extruded/cut - leave
+  // them out of the solid until the line tool closes them again.
+  const additives = shapes.filter(s => s.isAdditive && !s.open);
+  const holes = shapes.filter(s => s.isHole && !s.open);
   if (additives.length === 0) return null;
 
   const material = new THREE.MeshStandardMaterial({ color: 0x8fb8ff, metalness: 0.1, roughness: 0.7, side: THREE.DoubleSide });
@@ -3480,6 +3720,7 @@ async function rebuildSolid() {
   if (hadErrorShape) render();
   extrudeStatusEl.textContent = result.warnings.join(' ');
   btnExport.disabled = false;
+  btnExportStep.disabled = false;
   modelCommitted = true;
   updateFaceEditUI();
   renderEdgeFilletList();
@@ -3588,6 +3829,7 @@ async function runLivePreview() {
   if (hadErrorShape) render();
   extrudeStatusEl.textContent = result.warnings.join(' ');
   btnExport.disabled = false;
+  btnExportStep.disabled = false;
   updateFaceEditUI();
 }
 
@@ -4305,6 +4547,13 @@ function onViewerPointerUp(evt) {
     if (!result) return;
     faceSelectMode = false;
     clearHoverHighlight();
+    if (faceSelectPurpose === 'exportDxf') {
+      // No lasting selection highlight / edit mode - just grab the outline
+      // and download it, leaving the model exactly as it was.
+      updateFaceEditUI();
+      exportFaceAsDxf(result);
+      return;
+    }
     const adj = getOrBuildAdjacency(hit.object);
     clearSelectedHighlight();
     selectedFaceHighlight = new THREE.Mesh(buildHighlightGeometry(adj, result.triIndices, result.basis.normal), HIGHLIGHT_MATERIAL_SELECTED);
@@ -4502,6 +4751,7 @@ function enterFaceEditMode(pick) {
   closeFilletEditor(false);
   endDrag();
   endBgImageDrag();
+  endRotateDrag();
   selectedShapeIds.clear();
   selectedBgImageId = null;
   baseRollback = false;
@@ -4567,6 +4817,7 @@ function exitFaceEditMode(commit) {
   closePivotEditor(false);
   endDrag();
   endBgImageDrag();
+  endRotateDrag();
   selectedShapeIds.clear();
   selectedBgImageId = null;
 
@@ -4700,6 +4951,7 @@ function goToTimelineEntry(idx) {
     }
     baseRollback = true;
     btnExport.disabled = true;
+    btnExportStep.disabled = true;
     extrudeStatusEl.textContent = 'Zurückgerollt zur Basis-Skizze (Vorschau zeigt nur die Basis, ohne Flächen-Features). „Übernehmen“ klicken, um bis zum Ende des Verlaufs zu aktualisieren.';
     selectedShapeIds.clear();
     renderShapeList();
@@ -4801,6 +5053,7 @@ function updateFaceEditUI() {
   if (editControls) editControls.style.display = faceEditContext ? 'flex' : 'none';
   if (newPlanePanelBlock) newPlanePanelBlock.style.display = newPlaneMode ? 'block' : 'none';
   btnEditFace.disabled = !modelCommitted || faceSelectMode || !!faceEditContext || newPlaneMode;
+  btnExportFaceDxf.disabled = !modelCommitted || faceSelectMode || !!faceEditContext || newPlaneMode;
   btnNewPlane.disabled = !modelCommitted || faceSelectMode || !!faceEditContext || newPlaneMode;
 
   if (title) {
@@ -4820,6 +5073,7 @@ function updateFaceEditUI() {
 }
 
 const btnEditFace = document.getElementById('btn-edit-face');
+const btnExportFaceDxf = document.getElementById('btn-export-face-dxf');
 const btnCancelFaceSelect = document.getElementById('btn-cancel-face-select');
 const btnCancelFaceEdit = document.getElementById('btn-cancel-face-edit');
 const btnNewPlane = document.getElementById('btn-new-plane');
@@ -4833,6 +5087,14 @@ const btnCancelPlane = document.getElementById('btn-cancel-plane');
 
 btnEditFace.addEventListener('click', () => {
   if (!modelCommitted || faceEditContext || faceSelectMode || newPlaneMode) return;
+  faceSelectPurpose = 'edit';
+  faceSelectMode = true;
+  updateFaceEditUI();
+});
+
+btnExportFaceDxf.addEventListener('click', () => {
+  if (!modelCommitted || faceEditContext || faceSelectMode || newPlaneMode) return;
+  faceSelectPurpose = 'exportDxf';
   faceSelectMode = true;
   updateFaceEditUI();
 });
@@ -5038,6 +5300,7 @@ function loadProject(data) {
   closeEdgeFilletEditor(false);
   endDrag();
   endBgImageDrag();
+  endRotateDrag();
   faceSelectMode = false;
   faceEditContext = null;
   baseRollback = false;
@@ -5124,6 +5387,112 @@ btnExport.addEventListener('click', () => {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 });
+
+btnExportStep.addEventListener('click', () => {
+  if (!currentSolidForPicking) return;
+  const blob = currentSolidForPicking.blobSTEP();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'modell.step';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+});
+
+// ===========================================================================
+// DXF export - a flat 2D outline as a laser/plotter template for a flat part
+// like a gasket. Two entry points, both independent of the 3D extrusion/STL
+// export above: the current 2D sketch (btn-export-dxf, works even before
+// "Übernehmen"), and a picked flat face of the finished 3D model
+// (btn-export-face-dxf - see startFaceDxfExport / the faceSelectPurpose branch
+// in onViewerPointerUp).
+// ===========================================================================
+
+// Minimal ASCII DXF R12 (AC1009) writer. Takes a flat list of entities, each
+// either {circle:{cx,cy,r}} or {polyline:[{x,y},...], closed:bool}, and lands
+// them all on layer "0" - CAM/laser software infers inside/outside (part vs.
+// hole) from the closed loops alone, so no isHole/isAdditive concept is needed.
+function entitiesToDxf(entities) {
+  const lines = [];
+  const push = (code, value) => { lines.push(String(code), String(value)); };
+
+  push(0, 'SECTION'); push(2, 'HEADER');
+  push(9, '$ACADVER'); push(1, 'AC1009');
+  push(0, 'ENDSEC');
+
+  push(0, 'SECTION'); push(2, 'ENTITIES');
+  entities.forEach(e => {
+    if (e.circle) {
+      push(0, 'CIRCLE'); push(8, '0');
+      push(10, e.circle.cx); push(20, e.circle.cy); push(30, 0);
+      push(40, e.circle.r);
+    } else if (e.polyline && e.polyline.length >= 2) {
+      push(0, 'POLYLINE'); push(8, '0');
+      push(66, 1); push(70, e.closed ? 1 : 0);
+      e.polyline.forEach(p => {
+        push(0, 'VERTEX'); push(8, '0');
+        push(10, p.x); push(20, p.y); push(30, 0);
+      });
+      push(0, 'SEQEND');
+    }
+  });
+  push(0, 'ENDSEC');
+  push(0, 'EOF');
+
+  return lines.join('\n') + '\n';
+}
+
+function downloadDxf(text, filename) {
+  const blob = new Blob([text], { type: 'application/dxf' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// The current 2D sketch as DXF entities: polygon shapes via their already-
+// tessellated outline (see getOutlinePoints, so fillets and bent/bulge edges
+// come out as their approximated arc rather than a straight chord), circle
+// shapes as true CIRCLE entities.
+function sketchToDxfEntities() {
+  const entities = [];
+  shapes.forEach(shape => {
+    if (shape.type === 'circle') {
+      entities.push({ circle: { cx: shape.center.x, cy: shape.center.y, r: shape.radius } });
+    } else if (shape.type === 'polygon') {
+      const pts = getOutlinePoints(shape);
+      if (pts.length >= 2) entities.push({ polyline: pts, closed: !shape.open });
+    }
+  });
+  return entities;
+}
+
+btnExportDxf.addEventListener('click', () => {
+  if (shapes.length === 0) return;
+  downloadDxf(entitiesToDxf(sketchToDxfEntities()), 'skizze.dxf');
+});
+
+// A picked flat face's outer boundary + inner loops (holes), in the face's own
+// flattened UV frame (mm), exported as closed polylines - the flat blank you'd
+// cut to match that face. The loops come straight from the same face-region
+// trace used to sketch on a face (see getFaceRegionForHit / buildFaceRegionResult).
+function exportFaceAsDxf(result) {
+  const entities = [];
+  if (result.boundaryLoopUV && result.boundaryLoopUV.length >= 2) {
+    entities.push({ polyline: result.boundaryLoopUV, closed: true });
+  }
+  (result.innerLoopsUV || []).forEach(loop => {
+    if (loop.length >= 2) entities.push({ polyline: loop, closed: true });
+  });
+  if (entities.length === 0) return;
+  downloadDxf(entitiesToDxf(entities), 'flaeche.dxf');
+}
 
 // ===========================================================================
 // Init

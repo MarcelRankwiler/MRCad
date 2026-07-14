@@ -43,7 +43,7 @@ $mimeTypes = @{
   '.svg'  = 'image/svg+xml'
 }
 
-Write-Host "MR-CAD (BREP) läuft auf $prefix - im Browser öffnen, dann Strg+C hier zum Beenden."
+Write-Host "MR-CAD läuft auf $prefix - im Browser öffnen, dann Strg+C hier zum Beenden."
 
 try {
   while ($listener.IsListening) {
