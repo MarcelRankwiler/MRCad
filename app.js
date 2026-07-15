@@ -30,6 +30,9 @@ let mousePos = null;      // current mouse position (canvas space), for previews
 let selectedShapeIds = new Set(); // Ctrl/Cmd-click adds/removes a shape in the 'select' tool, for multi-drag/multi-edit
 let selectedSegment = null; // 'lineselect' tool: {shapeId, segIndex} of the currently picked edge, or null - Delete opens the shape at that edge
 let alignGuideSeg = null; // 'alignline' tool: {shapeId, segIndex} of the picked guide line, waiting for a follow-line click - see performAlignLine()
+let dimCtrlHeld = false;  // Ctrl/Cmd held while the 'dimension' tool is active - switches its click behavior from openLengthEditor to the fixed/driven distance pick below, see distanceFixedSel
+let distanceFixedSel = null; // 'dimension' tool + Ctrl: {type:'point'|'line', shapeId, ...} of the picked fixed point/line, waiting for the driven point/line click - see performDistance()
+let distEditor = null;    // active distance <input> ("Lineal") overlay, if any - see openDistanceEditor()
 let reopenedShape = null;   // an open (shape.open) polygon lifted into drawingPoints for re-closing with the line tool - its props/points, restored on cancel, reapplied on finishPolygon
 let errorShapeId = null;  // shape blamed for the most recent failed extrude (see buildBaseGroup/rebuildSolid) - drawn in red until the next extrude attempt
 let extrudedGroup = null; // THREE.Group currently in the viewer, exportable
@@ -1361,6 +1364,8 @@ function render() {
   if (currentTool === 'select') drawBackgroundImageHandles();
   if (currentTool === 'lineselect') drawLineSelectHandles();
   if (currentTool === 'alignline') drawAlignLineHandles();
+  if (currentTool === 'dimension' && (dimCtrlHeld || distanceFixedSel)) drawDistanceHandles();
+  if (distEditor) drawDistanceRuler();
   if (currentTool === 'line' || currentTool === 'lineselect') drawOpenShapeEnds();
   drawDragLabel();
 
@@ -1857,6 +1862,74 @@ function drawAlignLineHandles() {
   ctx.restore();
 }
 
+// "Maße" tool + Ctrl: highlights every clickable line (closed-polygon edges,
+// same restriction as lineselect/alignline) and point (see drawPointHandles)
+// so it's clear what can be picked for the fixed/driven distance pick, then
+// draws the already-picked fixed point/line on top in a distinct color while
+// waiting for the driven click - see performDistance()/openDistanceEditor().
+function drawDistanceHandles() {
+  ctx.save();
+  ctx.strokeStyle = '#37e6b3';
+  ctx.lineWidth = 3 / viewScale;
+  shapes.forEach(s => {
+    if (s.type !== 'polygon' || s.open) return;
+    for (let j = 0; j < s.points.length; j++) {
+      const a = s.points[j];
+      const b = s.points[(j + 1) % s.points.length];
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+  });
+  ctx.restore();
+  drawPointHandles();
+  if (!distanceFixedSel) return;
+  ctx.save();
+  ctx.strokeStyle = '#ff5f5f';
+  ctx.lineWidth = 4 / viewScale;
+  if (distanceFixedSel.type === 'line') {
+    const line = distSelLine(distanceFixedSel);
+    if (line) {
+      ctx.beginPath();
+      ctx.moveTo(line.a.x, line.a.y);
+      ctx.lineTo(line.b.x, line.b.y);
+      ctx.stroke();
+    }
+  } else {
+    const p = distSelPoint(distanceFixedSel);
+    if (p) dot(p, '#ff5f5f', 6);
+  }
+  ctx.restore();
+}
+
+// Dimension "Lineal": while distEditor is open, draws a dimension line between
+// the fixed reference point and where the driven point/line will land once
+// the typed value is applied (perpendicular ticks at both ends) - a live
+// preview that updates as the input value changes, see distEditor.axis/refFixed.
+function drawDistanceRuler() {
+  const { refFixed, axis, curDist, input } = distEditor;
+  const val = parseFloat(input.value);
+  const shownDist = !isNaN(val) && val > 0 ? val : curDist;
+  const p1 = refFixed;
+  const p2 = { x: refFixed.x + axis.x * shownDist, y: refFixed.y + axis.y * shownDist };
+  const tick = 6 / viewScale;
+  const perp = { x: -axis.y * tick, y: axis.x * tick };
+  ctx.save();
+  ctx.strokeStyle = '#ffcc55';
+  ctx.lineWidth = 2 / viewScale;
+  ctx.beginPath();
+  ctx.moveTo(p1.x, p1.y);
+  ctx.lineTo(p2.x, p2.y);
+  ctx.moveTo(p1.x - perp.x, p1.y - perp.y);
+  ctx.lineTo(p1.x + perp.x, p1.y + perp.y);
+  ctx.moveTo(p2.x - perp.x, p2.y - perp.y);
+  ctx.lineTo(p2.x + perp.x, p2.y + perp.y);
+  ctx.stroke();
+  ctx.restore();
+  drawLiveLabel((p1.x + p2.x) / 2, (p1.y + p2.y) / 2 - 10 / viewScale, shownDist.toFixed(1) + ' mm');
+}
+
 // Marks the two open ends of every open shape (see drawShape) with a dot, so
 // the user can see where to click with the line tool to continue/re-close them.
 function drawOpenShapeEnds() {
@@ -1938,7 +2011,10 @@ const TOOL_SHORTCUTS = {
     ['Entf / Backspace', 'Gewählte Linie löschen - die Form wird dort geöffnet'],
     ['Linien-Werkzeug', 'Offene Form am Endpunkt anklicken und wieder verschließen'],
   ],
-  dimension: [['Klick', 'Linie, Kreis oder gebogene Linie anklicken, Länge/Radius eingeben']],
+  dimension: [
+    ['Klick', 'Linie, Kreis oder gebogene Linie anklicken, Länge/Radius eingeben'],
+    ['Strg + Klick', 'Fixen Punkt/Linie anklicken, dann getriebenen Punkt/Linie - Lineal zum Eingeben des Abstands erscheint'],
+  ],
   origin: [['Klick', 'Eckpunkt oder Mittelpunkt als neuen Ursprung setzen']],
   point: [
     ['Klick', 'Eckpunkt oder Mittelpunkt anklicken, Koordinaten bearbeiten'],
@@ -1972,6 +2048,7 @@ function setTool(tool) {
   currentTool = tool;
   cancelInProgress();
   closeLengthEditor(true);
+  closeDistanceEditor(true);
   closePointEditor(true);
   closeFilletEditor(true);
   closePivotEditor(true);
@@ -2023,6 +2100,7 @@ function cancelInProgress() {
   angleLockSnapHit = null;
   angleLockAlignFrom = null;
   alignGuideSeg = null;
+  distanceFixedSel = null;
 }
 
 // The additiveSide ('top'/'bottom'/'center') a freshly drawn shape should
@@ -2201,6 +2279,7 @@ canvas.addEventListener('mouseleave', () => {
 canvas.addEventListener('wheel', (evt) => {
   evt.preventDefault();
   closeLengthEditor(true);
+  closeDistanceEditor(true);
   closePointEditor(true);
   closeFilletEditor(true);
   closePivotEditor(true);
@@ -2220,6 +2299,7 @@ canvas.addEventListener('mousedown', (evt) => {
   if (evt.button !== 1) return;
   evt.preventDefault();
   closeLengthEditor(true);
+  closeDistanceEditor(true);
   closePointEditor(true);
   closeFilletEditor(true);
   closePivotEditor(true);
@@ -2764,6 +2844,10 @@ canvas.addEventListener('click', (evt) => {
     render();
     return;
   } else if (currentTool === 'dimension') {
+    if (evt.ctrlKey || evt.metaKey) {
+      pickDistanceTarget(raw);
+      return;
+    }
     const hit = hitTestSegment(raw);
     if (hit) openLengthEditor(hit);
   } else if (currentTool === 'origin') {
@@ -2858,6 +2942,12 @@ document.addEventListener('keydown', (evt) => {
     if (tag === 'INPUT' || tag === 'TEXTAREA') return; // don't hijack text editing
     rKeyDown = true;
   }
+  // Ctrl held in the 'dimension' tool: switches clicks from openLengthEditor to
+  // the fixed/driven distance pick - see pickDistanceTarget()/drawDistanceHandles().
+  if ((evt.key === 'Control' || evt.key === 'Meta') && currentTool === 'dimension' && !dimCtrlHeld) {
+    dimCtrlHeld = true;
+    render();
+  }
 });
 
 document.addEventListener('keyup', (evt) => {
@@ -2870,6 +2960,10 @@ document.addEventListener('keyup', (evt) => {
   }
   if (evt.key.toLowerCase() === 'r') rKeyDown = false;
   if (evt.key === 'Shift' && curveBulgeActive) commitCurveBulge();
+  if ((evt.key === 'Control' || evt.key === 'Meta') && dimCtrlHeld) {
+    dimCtrlHeld = false;
+    render();
+  }
 });
 
 function deleteShape(id) {
@@ -3802,6 +3896,215 @@ function performAlignLine(guideSeg, followSeg) {
   pushHistory();
   shapesInGroup(followShape).forEach(sh => rotateShapeAround(sh, pivot, deltaDeg));
   onShapesChanged();
+}
+
+// ---- "Maße" tool + Ctrl: distance between a fixed and a driven point/line ---
+// Mirrors performAlignLine's two-click pick (first click = fixed/reference,
+// second click = driven), but drives a translation instead of a rotation, and
+// works on points as well as lines - see openDistanceEditor()/applyDistance().
+
+// Resolves a selection's current world point - `kind`/`index`/`groupId` follow
+// the same convention as hitTestPoint()'s return value.
+function distSelPoint(sel) {
+  const s = shapes.find(sh => sh.id === sel.shapeId);
+  if (!s) return null;
+  if (sel.kind === 'vertex') return s.points[sel.index];
+  if (sel.kind === 'groupcenter') return groupCenterOf(sel.groupId);
+  return s.type === 'circle' ? s.center : centroidOf(s);
+}
+
+// Resolves a line selection's current endpoints ({shapeId, segIndex}, closed
+// polygons only - same restriction as lineselect/alignline).
+function distSelLine(sel) {
+  const s = shapes.find(sh => sh.id === sel.shapeId);
+  if (!s || s.type !== 'polygon') return null;
+  const n = s.points.length;
+  return { a: s.points[sel.segIndex], b: s.points[(sel.segIndex + 1) % n] };
+}
+
+function distSelSameTarget(a, b) {
+  if (!a || !b || a.type !== b.type) return false;
+  if (a.type === 'line') return a.shapeId === b.shapeId && a.segIndex === b.segIndex;
+  return a.shapeId === b.shapeId && a.kind === b.kind && a.index === b.index && a.groupId === b.groupId;
+}
+
+// The polygon vertex index(es) a selection pins down: a single index for a
+// vertex, both endpoints for a line - i.e. exactly the points a same-shape
+// distance edit is allowed to move (see pickDistanceTarget). null for a
+// selection that has no single vertex of its own (a shape's centroid/a
+// circle's center, or a group's shared center) - moving "the whole shape" is
+// exactly the rigid-body move a same-shape edit can't do, see below.
+function distSelVertexIndices(sel, shape) {
+  if (sel.type === 'point' && sel.kind === 'vertex') return [sel.index];
+  if (sel.type === 'line') {
+    const n = shape.points.length;
+    return [sel.segIndex, (sel.segIndex + 1) % n];
+  }
+  return null;
+}
+
+// Hit-tests a point first (smaller/more specific target), falling back to a
+// closed-polygon edge, and returns the {type, shapeId, ...} selection shape
+// used throughout this section - or null if neither was hit.
+function hitTestDistanceTarget(raw) {
+  const pHit = hitTestPoint(raw);
+  if (pHit) return { type: 'point', shapeId: pHit.shape.id, kind: pHit.kind, index: pHit.index, groupId: pHit.groupId };
+  const sHit = hitTestSegment(raw);
+  if (sHit && sHit.segIndex !== null && sHit.shape.type === 'polygon' && !sHit.shape.open) {
+    return { type: 'line', shapeId: sHit.shape.id, segIndex: sHit.segIndex };
+  }
+  return null;
+}
+
+// Ctrl-click in the 'dimension' tool: first click picks the fixed reference,
+// second click picks the driven point/line and opens the ruler input.
+function pickDistanceTarget(raw) {
+  const sel = hitTestDistanceTarget(raw);
+  if (!distanceFixedSel) {
+    distanceFixedSel = sel;
+  } else if (sel && distSelSameTarget(sel, distanceFixedSel)) {
+    distanceFixedSel = null; // clicking the fixed selection again deselects it
+  } else if (sel) {
+    const fixedShape = shapes.find(sh => sh.id === distanceFixedSel.shapeId);
+    const drivenShape = shapes.find(sh => sh.id === sel.shapeId);
+    const sameShape = fixedShape && drivenShape && fixedShape.id === drivenShape.id;
+    const sameGroup = !sameShape && fixedShape && drivenShape
+      && fixedShape.groupId != null && fixedShape.groupId === drivenShape.groupId;
+    if (sameShape) {
+      // Two points/lines of the very same shape can still be dimensioned
+      // against each other - but only by moving the driven side's own
+      // vertex/vertices (see distSelVertexIndices), never the whole shape:
+      // translating the whole thing wouldn't change the distance between two
+      // of its own points at all, since both would move together.
+      const drivenIdx = distSelVertexIndices(sel, drivenShape);
+      const fixedIdx = distSelVertexIndices(distanceFixedSel, fixedShape);
+      if (drivenShape.type !== 'polygon' || !drivenIdx || !fixedIdx) {
+        alert('Der Mittelpunkt eines Objekts hat keinen eigenen Eckpunkt, der sich unabhängig verschieben ließe - das lässt sich nicht bemaßen.');
+      } else if (drivenIdx.some(i => fixedIdx.includes(i))) {
+        alert('Fixer und getriebener Punkt teilen sich einen Eckpunkt - das lässt sich nicht bemaßen.');
+      } else {
+        openDistanceEditor(distanceFixedSel, sel, raw, drivenIdx);
+      }
+    } else if (sameGroup) {
+      alert('Fixer und getriebener Punkt/Linie gehören zur selben Gruppe - das lässt sich nicht bemaßen.');
+    } else {
+      openDistanceEditor(distanceFixedSel, sel, raw);
+    }
+    distanceFixedSel = null;
+  } else {
+    distanceFixedSel = null;
+  }
+  render();
+}
+
+// Returns the {axis (unit vector), curDist, refFixed, refDriven} used to both
+// draw the ruler and apply the new distance. `axis` always points from the
+// fixed side toward the driven side, so `refFixed + axis*newDist` is where the
+// driven reference point should end up. When either side is a line, the axis
+// is that line's normal (perpendicular distance); with two points it's simply
+// the direction between them (their distance, direction preserved).
+function computeDistanceAxis(fixed, driven) {
+  let axis, refFixed, refDriven;
+  if (fixed.type === 'line') {
+    const { a, b } = distSelLine(fixed);
+    const len = dist(a, b) || 1;
+    axis = { x: -(b.y - a.y) / len, y: (b.x - a.x) / len };
+    refFixed = a;
+    refDriven = driven.type === 'line' ? distSelLine(driven).a : distSelPoint(driven);
+  } else if (driven.type === 'line') {
+    const { a, b } = distSelLine(driven);
+    const len = dist(a, b) || 1;
+    axis = { x: -(b.y - a.y) / len, y: (b.x - a.x) / len };
+    refFixed = distSelPoint(fixed);
+    refDriven = a;
+  } else {
+    refFixed = distSelPoint(fixed);
+    refDriven = distSelPoint(driven);
+    const dx = refDriven.x - refFixed.x, dy = refDriven.y - refFixed.y;
+    const len = Math.hypot(dx, dy);
+    axis = len > 1e-9 ? { x: dx / len, y: dy / len } : { x: 1, y: 0 };
+  }
+  let signed = (refDriven.x - refFixed.x) * axis.x + (refDriven.y - refFixed.y) * axis.y;
+  if (signed < 0) { axis = { x: -axis.x, y: -axis.y }; signed = -signed; }
+  return { axis, curDist: signed, refFixed, refDriven };
+}
+
+function translateShapesBy(shapesArr, dx, dy) {
+  shapesArr.forEach(sh => {
+    if (sh.type === 'circle') sh.center = { x: sh.center.x + dx, y: sh.center.y + dy };
+    else sh.points = sh.points.map(p => ({ x: p.x + dx, y: p.y + dy }));
+    if (sh.pivot) sh.pivot = { x: sh.pivot.x + dx, y: sh.pivot.y + dy };
+  });
+}
+
+// Translates the driven side along `axis` so its reference point ends up
+// exactly `newDist` away from the fixed reference point along that axis.
+// Normally that means the whole driven shape (and its group-mates, e.g. text
+// letters or a hole-circle pattern); `vertexIdx`, if given (a same-shape
+// edit - see pickDistanceTarget), instead moves only those vertex indices of
+// the driven shape itself, leaving the rest of it (including the fixed side)
+// untouched.
+function applyDistance(fixed, driven, newDist, vertexIdx) {
+  const drivenShape = shapes.find(sh => sh.id === driven.shapeId);
+  if (!drivenShape) return;
+  const { axis, curDist } = computeDistanceAxis(fixed, driven);
+  const t = newDist - curDist;
+  if (Math.abs(t) < 1e-9) return;
+  pushHistory();
+  if (vertexIdx) {
+    vertexIdx.forEach(i => {
+      const p = drivenShape.points[i];
+      drivenShape.points[i] = { x: p.x + axis.x * t, y: p.y + axis.y * t };
+    });
+  } else {
+    translateShapesBy(shapesInGroup(drivenShape), axis.x * t, axis.y * t);
+  }
+  onShapesChanged();
+}
+
+function closeDistanceEditor(apply) {
+  if (!distEditor) return;
+  const { input, wrap, fixed, driven, vertexIdx } = distEditor;
+  distEditor = null; // clear first so the blur triggered by remove() below doesn't recurse
+  if (apply) {
+    const val = parseFloat(input.value);
+    if (!isNaN(val) && val > 0) applyDistance(fixed, driven, val, vertexIdx);
+  }
+  wrap.remove();
+  render();
+}
+
+function openDistanceEditor(fixed, driven, clickRaw, vertexIdx) {
+  closeDistanceEditor(true);
+  const { axis, curDist, refFixed } = computeDistanceAxis(fixed, driven);
+
+  const mid = { x: (refFixed.x + clickRaw.x) / 2, y: (refFixed.y + clickRaw.y) / 2 };
+  const screenPos = worldToScreen(mid.x, mid.y);
+  const wrap = document.createElement('div');
+  wrap.className = 'dim-editor-wrap';
+  wrap.style.left = (canvas.offsetLeft + screenPos.x) + 'px';
+  wrap.style.top = (canvas.offsetTop + screenPos.y) + 'px';
+
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.className = 'dim-editor';
+  input.step = '0.1';
+  input.min = '0.1';
+  input.value = curDist.toFixed(1);
+  input.addEventListener('input', () => render()); // live-update the ruler preview
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') closeDistanceEditor(true);
+    else if (e.key === 'Escape') closeDistanceEditor(false);
+  });
+  input.addEventListener('blur', () => closeDistanceEditor(true));
+  wrap.appendChild(input);
+
+  document.getElementById('sketch-pane').appendChild(wrap);
+  distEditor = { input, wrap, fixed, driven, axis, curDist, refFixed, vertexIdx };
+  input.focus();
+  input.select();
+  render();
 }
 
 function renderShapeList() {
