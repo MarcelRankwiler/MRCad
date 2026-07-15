@@ -24,9 +24,12 @@ let circleCenter = null;  // in-progress circle center
 let shapeStartPoint = null; // in-progress rect/regular-polygon tool: first click (corner or center)
 let splineProfileCenter = null; // in-progress Vielkeilprofil tool: center placed by the last click, while the panel is being configured - see computeSplineProfile()
 let splineProfileEditId = null; // id of an existing 'splineprofile' shape currently bound to the panel for post-hoc editing (via the shape list's "Bearbeiten" button), or null
+let polygonEditId = null; // id of an existing 'polygon' shape currently bound to the panel for post-hoc editing (via the shape list's "Bearbeiten" button), or null - see openPolygonEditor()
+let textEditGroupId = null; // groupId of an existing 'text' shape group currently bound to the panel for post-hoc editing (via the shape list's "Bearbeiten" button), or null - see openTextEditor()
 let mousePos = null;      // current mouse position (canvas space), for previews
 let selectedShapeIds = new Set(); // Ctrl/Cmd-click adds/removes a shape in the 'select' tool, for multi-drag/multi-edit
 let selectedSegment = null; // 'lineselect' tool: {shapeId, segIndex} of the currently picked edge, or null - Delete opens the shape at that edge
+let alignGuideSeg = null; // 'alignline' tool: {shapeId, segIndex} of the picked guide line, waiting for a follow-line click - see performAlignLine()
 let reopenedShape = null;   // an open (shape.open) polygon lifted into drawingPoints for re-closing with the line tool - its props/points, restored on cancel, reapplied on finishPolygon
 let errorShapeId = null;  // shape blamed for the most recent failed extrude (see buildBaseGroup/rebuildSolid) - drawn in red until the next extrude attempt
 let extrudedGroup = null; // THREE.Group currently in the viewer, exportable
@@ -172,6 +175,7 @@ function pushHistory() {
 const canvas = document.getElementById('sketch-canvas');
 const ctx = canvas.getContext('2d');
 const gridSizeInput = document.getElementById('grid-size');
+const gridUnitInput = document.getElementById('grid-unit');
 const gridOnInput = document.getElementById('grid-on');
 const angleStepInput = document.getElementById('angle-step');
 const angleOnInput = document.getElementById('angle-on');
@@ -222,8 +226,13 @@ function resizeCanvas() {
   render();
 }
 
+const MM_PER_INCH = 25.4;
+
+// World coordinates are always mm internally - the Snap-Raster field just lets
+// the user type/read that grid size in inches instead, converted here.
 function getGridSize() {
-  return Math.max(1, parseFloat(gridSizeInput.value) || 10);
+  const raw = Math.max(0.001, parseFloat(gridSizeInput.value) || 10);
+  return gridUnitInput.value === 'in' ? raw * MM_PER_INCH : raw;
 }
 
 // Snap increment to use for point placement / dragging: the configured grid size
@@ -262,7 +271,7 @@ function dist(a, b) {
 // N-gon), which all share the same "click start point, click again to set
 // size" interaction and produce a plain `polygon` shape under the hood.
 function isShapeTool(tool) {
-  return tool === 'rect' || tool.startsWith('poly');
+  return tool === 'rect' || tool === 'heart' || tool.startsWith('poly');
 }
 
 // Axis-aligned rectangle corners from two opposite corner points.
@@ -300,14 +309,112 @@ function holeCirclePieces(center) {
   return centers;
 }
 
+// Outline of a heart shape (classic parametric heart curve), centered on
+// `center` and scaled so its bottom tip sits `r` away from that center -
+// mirrors how a poly-N tool's radius reaches each vertex.
+function heartPoints(center, r, segments = 60) {
+  const raw = [];
+  for (let i = 0; i < segments; i++) {
+    const t = (i / segments) * 2 * Math.PI;
+    raw.push({
+      x: 16 * Math.pow(Math.sin(t), 3),
+      y: 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t),
+    });
+  }
+  const ys = raw.map(pt => pt.y);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const midY = (minY + maxY) / 2;
+  const scale = r / ((maxY - minY) / 2);
+  // y is negated so the tip points toward larger screen-Y (down), the
+  // customary "upright" heart orientation.
+  return raw.map(pt => ({ x: center.x + scale * pt.x, y: center.y - scale * (pt.y - midY) }));
+}
+
+// Reads the "Anzahl Ecken" input for the Polygon tool, clamped to [3, 100]
+// integer sides (defaults to 6 if the field is empty/invalid).
+function polygonToolSides() {
+  const raw = Math.round(parseFloat(document.getElementById('polygon-sides').value));
+  if (!Number.isFinite(raw)) return 6;
+  return Math.min(100, Math.max(3, raw));
+}
+
+// Reads the "Rundung (mm)" input for the Polygon tool - a corner-fillet radius applied
+// to every vertex, same units/meaning as the per-corner radius set by the "2D Ecken
+// abrunden" tool (see applyFillet/filletCornerArc). 0 (the default) means sharp corners.
+function polygonToolFillet() {
+  const raw = parseFloat(document.getElementById('polygon-fillet').value);
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
+// Shown while placing a new polygon (currentTool === 'polygon') or editing an
+// existing one (polygonEditId set) - mirrors updateSplineProfilePanelVisibility.
+function updatePolygonPanelVisibility() {
+  // A shape can be deleted (or undone) while its editor is open - drop the
+  // stale reference instead of letting "Änderungen übernehmen" silently do
+  // nothing/throw.
+  if (polygonEditId != null && !shapes.some(s => s.id === polygonEditId)) {
+    polygonEditId = null;
+  }
+  const editing = polygonEditId != null;
+  const show = currentTool === 'polygon' || editing;
+  document.getElementById('polygon-panel-block').style.display = show ? 'block' : 'none';
+  document.getElementById('polygon-edit-actions').style.display = editing ? 'flex' : 'none';
+}
+
+// Opens the panel bound to an existing 'polygon'-kind shape, pre-filled from its
+// stored parameters (not re-derived from its baked/rounded points) - see
+// centerX/centerY/radius/rotation/sides, set when the shape was created (or last
+// edited) below. Only shapes created by the current unified Polygon tool have
+// these - older poly3/poly5/poly6/poly8 shapes (from before the tools were
+// merged) keep their baked points as-is and aren't editable this way.
+function openPolygonEditor(shapeId) {
+  const shape = shapes.find(s => s.id === shapeId);
+  if (!shape || shape.kind !== 'polygon' || shape.centerX == null) return;
+  document.getElementById('polygon-sides').value = shape.sides || shape.points.length;
+  document.getElementById('polygon-fillet').value = (shape.filletRadii && shape.filletRadii[0]) || 0;
+  polygonEditId = shapeId;
+  updatePolygonPanelVisibility();
+}
+
+document.getElementById('btn-polygon-apply').addEventListener('click', () => {
+  const shape = shapes.find(s => s.id === polygonEditId);
+  if (!shape) { polygonEditId = null; updatePolygonPanelVisibility(); return; }
+  pushHistory();
+  const sides = polygonToolSides();
+  shape.sides = sides;
+  shape.points = regularPolygonPoints({ x: shape.centerX, y: shape.centerY }, shape.radius, sides, shape.rotation || 0);
+  const fillet = polygonToolFillet();
+  if (fillet > 0) {
+    const filletRadii = {};
+    for (let i = 0; i < sides; i++) filletRadii[i] = fillet;
+    shape.filletRadii = filletRadii;
+  } else {
+    delete shape.filletRadii;
+  }
+  onShapesChanged();
+  updatePolygonPanelVisibility();
+  render();
+});
+
+document.getElementById('btn-polygon-cancel').addEventListener('click', () => {
+  polygonEditId = null;
+  updatePolygonPanelVisibility();
+  render();
+});
+
 // Computes the preview/final point list for the shape currently being placed
-// with a rect/poly tool, given its start point and the (already snapped)
-// second point.
+// with a rect/poly/heart tool, given its start point and the (already
+// snapped) second point.
 function shapeToolPoints(tool, start, p) {
   if (tool === 'rect') return rectPoints(start, p);
-  const sides = parseInt(tool.slice(4), 10);
+  if (tool === 'heart') return heartPoints(start, dist(start, p));
+  const sides = tool === 'polygon' ? polygonToolSides() : parseInt(tool.slice(4), 10);
   const r = dist(start, p);
-  const angle = Math.atan2(p.y - start.y, p.x - start.x);
+  let angle = Math.atan2(p.y - start.y, p.x - start.x);
+  if (angleOnInput.checked) {
+    const stepRad = Math.max(1, parseFloat(angleStepInput.value) || 45) * Math.PI / 180;
+    angle = Math.round(angle / stepRad) * stepRad;
+  }
   return regularPolygonPoints(start, r, sides, angle);
 }
 
@@ -379,7 +486,7 @@ function localArcPoints(r, angleFrom, angleTo) {
 // message - never returns NaN/Infinity coordinates or an obviously
 // self-intersecting flank.
 function computeSplineProfile(params) {
-  const fail = (msg) => ({ points: null, filletRadii: null, error: msg });
+  const fail = (msg) => ({ points: null, filletRadii: null, error: msg, computed: null });
 
   const z = Math.round(params.teeth);
   const m = params.module;
@@ -494,7 +601,249 @@ function computeSplineProfile(params) {
   if (points.length < 3 || points.some(p => !Number.isFinite(p.x) || !Number.isFinite(p.y))) {
     return fail('Berechnung ergab keine gültige Geometrie (Parameter prüfen).');
   }
-  return { points, filletRadii: Object.keys(filletRadii).length ? filletRadii : null, error: null };
+  // Read-only diagnostic values for display only (see "Berechnete Werte" in the
+  // panel) - purely derived from the values already computed above, no new
+  // geometry rules; doesn't change what's returned to any existing caller.
+  const computed = {
+    pitchAngleDeg: 360 / z,
+    pitchDiameter: 2 * rPitch,
+    baseDiameter: 2 * rb,
+    tipDiameter: 2 * rTip,
+    rootDiameter: 2 * rRoot,
+    circularPitch: Math.PI * m,
+    pressureAngleDeg: params.pressureAngle,
+  };
+  return { points, filletRadii: Object.keys(filletRadii).length ? filletRadii : null, error: null, computed };
+}
+
+// ===========================================================================
+// Straight-flank spline/serration profiles (DIN 5481 "Kerbverzahnung" and
+// ISO 14 straight-sided splines) - deliberately NOT involutes, per spec.
+// Both use the exact same construction: each tooth is a plain RADIAL wedge -
+// two straight flank lines at a constant angle ±halfToothAngle from the
+// tooth's own centerline, from the root circle out to the tip circle - capped
+// by a real circular arc at the tip ("own" arc) and, between teeth, a real
+// circular arc at the root ("gap" arc). Because the flank angle is constant
+// regardless of radius, the flank is a genuine straight line (no
+// tessellation needed) AND the tip/gap arc angles never depend on which of
+// root/tip is numerically larger, so - unlike a tapering flank - this needs
+// no internal/external mirroring trick to stay a simple, correctly-wound,
+// non-self-intersecting polygon: it's safe by construction for both. This is
+// a deliberate simplification for a first version (see task notes); DIN 5481
+// nominally also allows non-radial flanks, not attempted here.
+//
+// Reuses rotateAroundOrigin/localArcPoints from the involute generator above,
+// and (for the optional root fillet) the existing filletRadii/
+// getOutlinePoints mechanism - no changes to either.
+// ===========================================================================
+
+// Replaces sharp corner `curr` with a small flat chamfer (two points along
+// its adjacent edges, offset by `size`) - same tangent-length-style clamp as
+// filletCornerArc, just a flat cut instead of an arc. Used for the optional
+// "Abflachung" (flat) corners below; baked directly into the generated
+// points at creation time (unlike filletRadii, this isn't a generic per-shape
+// live-editable feature, so it doesn't touch getOutlinePoints).
+function chamferCornerPoints(prev, curr, next, size) {
+  if (!(size > 0)) return [curr];
+  const v1x = prev.x - curr.x, v1y = prev.y - curr.y, len1 = Math.hypot(v1x, v1y);
+  const v2x = next.x - curr.x, v2y = next.y - curr.y, len2 = Math.hypot(v2x, v2y);
+  if (len1 < 1e-9 || len2 < 1e-9) return [curr];
+  const t = Math.min(size, len1 * 0.499, len2 * 0.499);
+  if (t < 1e-6) return [curr];
+  return [
+    { x: curr.x + (v1x / len1) * t, y: curr.y + (v1y / len1) * t },
+    { x: curr.x + (v2x / len2) * t, y: curr.y + (v2y / len2) * t },
+  ];
+}
+
+// Builds the closed, world-space outline of a radial-flank tooth profile
+// (shared by computeSerrationProfile/computeStraightSidedSplineProfile
+// below), given the root/tip radii, the tooth's half-angle at its centerline,
+// and the optional corner treatments. `rGapEnd`/`rOwnEnd` mean exactly what
+// they do in computeSplineProfile above (gap = root, own = tip, always -
+// regardless of internal/external, which is already baked into which of the
+// two is numerically larger by the caller). Returns {points, filletRadii,
+// error} - never NaN/Infinity coordinates, and rejects (with a short German
+// message) any input that would make the flanks or gap overlap.
+function assembleRadialFlankProfile({ z, rGapEnd, rOwnEnd, halfToothAngle, rotation, centerX, centerY, rootFillet, tipFlat, rootFlat }) {
+  const fail = (msg) => ({ points: null, filletRadii: null, error: msg });
+  if (!(rGapEnd > 0) || !(rOwnEnd > 0)) return fail('Kopf- und Fußkreis müssen größer als 0 sein.');
+  const pitchAngle = (2 * Math.PI) / z;
+  if (!(halfToothAngle > 1e-6)) return fail('Flankenwinkel bzw. Zahnbreite muss größer als 0 sein.');
+  if (!(halfToothAngle * 2 < pitchAngle - 1e-9)) {
+    return fail('Flankenwinkel bzw. Zahnbreite ist zu groß für die Zähnezahl - Zahnflanken überschneiden sich.');
+  }
+
+  const rightGapPoint = { x: rGapEnd * Math.cos(-halfToothAngle), y: rGapEnd * Math.sin(-halfToothAngle) };
+  const rightOwnPoint = { x: rOwnEnd * Math.cos(-halfToothAngle), y: rOwnEnd * Math.sin(-halfToothAngle) };
+  const leftOwnPoint = { x: rightOwnPoint.x, y: -rightOwnPoint.y };
+  const leftGapPoint = { x: rightGapPoint.x, y: -rightGapPoint.y };
+
+  const ownArcLocal = localArcPoints(rOwnEnd, -halfToothAngle, halfToothAngle);
+  const gapArcLocal = localArcPoints(rGapEnd, halfToothAngle, pitchAngle - halfToothAngle);
+
+  // One tooth's local (unrotated) sharp-cornered outline: gap-right -> flank
+  // -> own-right -> [tip arc] -> own-left -> flank -> gap-left. The following
+  // gap-arc (between this tooth and the next) is appended per-repetition below.
+  const toothLocal = [rightGapPoint, rightOwnPoint, ...ownArcLocal, leftOwnPoint, leftGapPoint];
+  const ownRightIdx = 1;
+  const ownLeftIdx = 2 + ownArcLocal.length;
+  const gapLeftIdx = toothLocal.length - 1; // gapRightIdx is always 0
+
+  const points = [];
+  const filletRadii = {};
+  const chamferSizes = []; // parallel to `points` - resolved into flat cuts in the finishing pass below
+
+  for (let k = 0; k < z; k++) {
+    const toothAngle = rotation + k * pitchAngle;
+    toothLocal.forEach((p, i) => {
+      const rp = rotateAroundOrigin(p, toothAngle);
+      points.push({ x: rp.x + centerX, y: rp.y + centerY });
+      const isOwnCorner = i === ownRightIdx || i === ownLeftIdx;
+      const isGapCorner = i === 0 || i === gapLeftIdx;
+      chamferSizes.push(isOwnCorner ? (tipFlat > 0 ? tipFlat : 0) : (isGapCorner && !(rootFillet > 0) ? (rootFlat > 0 ? rootFlat : 0) : 0));
+      if (isGapCorner && rootFillet > 0) filletRadii[points.length - 1] = rootFillet;
+    });
+    gapArcLocal.forEach(p => {
+      const rp = rotateAroundOrigin(p, toothAngle);
+      points.push({ x: rp.x + centerX, y: rp.y + centerY });
+      chamferSizes.push(0);
+    });
+  }
+
+  let finalPoints = points, finalFillet = filletRadii;
+  if (chamferSizes.some(s => s > 0)) {
+    // Bake the flat corner cuts in one pass over the ORIGINAL (sharp) points -
+    // prev/next lookups stay correct via modulo indexing regardless of how
+    // many points earlier chamfers in this same pass have already emitted.
+    const n = points.length;
+    const out = [];
+    const filletOut = {};
+    for (let i = 0; i < n; i++) {
+      if (chamferSizes[i] > 0) {
+        const prev = points[(i - 1 + n) % n];
+        const next = points[(i + 1) % n];
+        chamferCornerPoints(prev, points[i], next, chamferSizes[i]).forEach(cp => out.push(cp));
+      } else {
+        if (filletRadii[i] != null) filletOut[out.length] = filletRadii[i];
+        out.push(points[i]);
+      }
+    }
+    finalPoints = out;
+    finalFillet = filletOut;
+  }
+
+  if (finalPoints.length < 3 || finalPoints.some(p => !Number.isFinite(p.x) || !Number.isFinite(p.y))) {
+    return fail('Berechnung ergab keine gültige Geometrie (Parameter prüfen).');
+  }
+  return { points: finalPoints, filletRadii: Object.keys(finalFillet).length ? finalFillet : null, error: null };
+}
+
+// DIN 5481 "Kerbverzahnung" - a straight-flank serration, NOT an involute
+// (see the derivation note above assembleRadialFlankProfile). `params.flankAngle`
+// (Lückenwinkel, degrees) is the angular width of the space between two
+// teeth - constant at every radius, since the flanks are radial lines.
+function computeSerrationProfile(params) {
+  const fail = (msg) => ({ points: null, filletRadii: null, error: msg, computed: null });
+  const z = Math.round(params.teeth);
+  if (!Number.isFinite(z) || z < 3) return fail('Zähnezahl muss eine ganze Zahl ≥ 3 sein.');
+  if (!Number.isFinite(params.centerX) || !Number.isFinite(params.centerY)) {
+    return fail('Mittelpunkt X/Y muss eine gültige Zahl sein.');
+  }
+  const nominalD = params.nominalDiameter;
+  if (!Number.isFinite(nominalD) || nominalD <= 0) return fail('Nenndurchmesser muss größer als 0 sein.');
+  const tipD = params.tipDiameter, rootD = params.rootDiameter;
+  if (!Number.isFinite(tipD) || tipD <= 0 || !Number.isFinite(rootD) || rootD <= 0) {
+    return fail('Kopfkreis- und Fußkreisdurchmesser müssen größer als 0 sein.');
+  }
+  const isInternal = !!params.internal;
+  if (isInternal ? !(rootD > tipD) : !(tipD > rootD)) {
+    return fail(isInternal
+      ? 'Bei Innenverzahnung muss der Fußkreisdurchmesser größer als der Kopfkreisdurchmesser sein.'
+      : 'Bei Außenverzahnung muss der Kopfkreisdurchmesser größer als der Fußkreisdurchmesser sein.');
+  }
+  const rTip = tipD / 2, rRoot = rootD / 2;
+  const rMin = Math.min(rTip, rRoot), rMax = Math.max(rTip, rRoot);
+  if (!(nominalD / 2 > rMin + 1e-6 && nominalD / 2 < rMax - 1e-6)) {
+    return fail('Nenndurchmesser muss zwischen Fußkreis- und Kopfkreisdurchmesser liegen.');
+  }
+  const gapAngleDeg = params.flankAngle;
+  const pitchAngleDeg = 360 / z;
+  if (!Number.isFinite(gapAngleDeg) || gapAngleDeg <= 0 || gapAngleDeg >= pitchAngleDeg) {
+    return fail('Lückenwinkel muss größer als 0° und kleiner als der Teilungswinkel (360°/Zähnezahl) sein.');
+  }
+  const halfToothAngle = ((pitchAngleDeg - gapAngleDeg) * Math.PI) / 180 / 2;
+
+  const assembled = assembleRadialFlankProfile({
+    z, rGapEnd: rRoot, rOwnEnd: rTip, halfToothAngle,
+    rotation: ((params.rotation || 0) * Math.PI) / 180,
+    centerX: params.centerX, centerY: params.centerY,
+    rootFillet: Math.max(0, params.rootFillet || 0),
+    tipFlat: Math.max(0, params.tipFlat || 0),
+    rootFlat: Math.max(0, params.rootFlat || 0),
+  });
+  if (assembled.error) return fail(assembled.error);
+  const computed = {
+    pitchAngleDeg,
+    circularPitch: ((pitchAngleDeg * Math.PI) / 180) * (nominalD / 2),
+    tipDiameter: tipD,
+    rootDiameter: rootD,
+  };
+  return { points: assembled.points, filletRadii: assembled.filletRadii, error: null, computed };
+}
+
+// ISO 14 straight-sided spline - also NOT an involute. `params.toothWidth`
+// (Zahnbreite/Nutbreite, mm) is measured at the mean of inner/outer diameter
+// and converted to the same constant flank half-angle every tooth uses (see
+// assembleRadialFlankProfile) - for external it's the tooth's own material
+// width, for internal the width of the groove it must leave open (the
+// material width is then the remaining pitch, see materialArcWidth below).
+function computeStraightSidedSplineProfile(params) {
+  const fail = (msg) => ({ points: null, filletRadii: null, error: msg, computed: null });
+  const z = Math.round(params.teeth);
+  if (!Number.isFinite(z) || z < 3) return fail('Zähnezahl/Keilanzahl muss eine ganze Zahl ≥ 3 sein.');
+  if (!Number.isFinite(params.centerX) || !Number.isFinite(params.centerY)) {
+    return fail('Mittelpunkt X/Y muss eine gültige Zahl sein.');
+  }
+  const innerD = params.innerDiameter, outerD = params.outerDiameter;
+  if (!Number.isFinite(innerD) || innerD <= 0 || !Number.isFinite(outerD) || outerD <= 0) {
+    return fail('Innen- und Außendurchmesser müssen größer als 0 sein.');
+  }
+  if (!(outerD > innerD)) return fail('Außendurchmesser muss größer als Innendurchmesser sein.');
+  const isInternal = !!params.internal;
+  // External: teeth grow outward from the shaft, root = inner, tip = outer.
+  // Internal: teeth grow inward from the bore, root = outer, tip = inner -
+  // same addendum/dedendum role swap as the involute generator uses.
+  const rRoot = (isInternal ? outerD : innerD) / 2;
+  const rTip = (isInternal ? innerD : outerD) / 2;
+  const referenceRadius = (innerD + outerD) / 4;
+  const pitchAngleDeg = 360 / z;
+  const pitchArc = ((pitchAngleDeg * Math.PI) / 180) * referenceRadius;
+
+  const width = params.toothWidth;
+  if (!Number.isFinite(width) || width <= 0) return fail('Zahnbreite bzw. Nutbreite muss größer als 0 sein.');
+  const materialArcWidth = isInternal ? (pitchArc - width) : width;
+  if (!(materialArcWidth > 1e-6 && materialArcWidth < pitchArc - 1e-9)) {
+    return fail('Zahnbreite bzw. Nutbreite passt nicht zur Zähnezahl und den Durchmessern.');
+  }
+  const halfToothAngle = materialArcWidth / (2 * referenceRadius);
+
+  const assembled = assembleRadialFlankProfile({
+    z, rGapEnd: rRoot, rOwnEnd: rTip, halfToothAngle,
+    rotation: ((params.rotation || 0) * Math.PI) / 180,
+    centerX: params.centerX, centerY: params.centerY,
+    rootFillet: Math.max(0, params.rootFillet || 0),
+    tipFlat: Math.max(0, params.tipFlat || 0),
+    rootFlat: 0, // not offered for ISO 14 - see panel
+  });
+  if (assembled.error) return fail(assembled.error);
+  const computed = {
+    pitchAngleDeg,
+    circularPitch: pitchArc,
+    tipDiameter: 2 * rTip,
+    rootDiameter: 2 * rRoot,
+  };
+  return { points: assembled.points, filletRadii: assembled.filletRadii, error: null, computed };
 }
 
 // ===========================================================================
@@ -523,8 +872,6 @@ const TEXT_FONTS = [
 ];
 const loadedTextFonts = {}; // key -> parsed opentype.js Font, once loaded
 let textFontsReady = false;
-let textMode = 'extrude'; // 'extrude' (raised/solid) | 'cut' (engraved/subtracted)
-let textSide = 'top';     // additiveSide for base-sketch raised text ('top'|'bottom')
 
 // Decodes a base64 string (from js/embedded-fonts.js) into an ArrayBuffer.
 function base64ToArrayBuffer(base64) {
@@ -562,33 +909,6 @@ function initTextTool() {
   statusEl.textContent = textFontsReady ? '' :
     'Schriftarten konnten nicht geladen werden (js/embedded-fonts.js fehlt oder ist beschädigt).';
 
-  const modeExtrudeBtn = document.getElementById('text-mode-extrude');
-  const modeCutBtn = document.getElementById('text-mode-cut');
-  const heightLabel = document.getElementById('text-height-label');
-  const sideRow = document.getElementById('text-side-row');
-  const updateModeUI = () => {
-    modeExtrudeBtn.classList.toggle('active', textMode === 'extrude');
-    modeCutBtn.classList.toggle('active', textMode === 'cut');
-    heightLabel.textContent = textMode === 'extrude' ? 'Höhe (mm)' : 'Tiefe (mm)';
-    sideRow.style.display = textMode === 'extrude' ? 'flex' : 'none';
-    render();
-  };
-  modeExtrudeBtn.addEventListener('click', () => { textMode = 'extrude'; updateModeUI(); });
-  modeCutBtn.addEventListener('click', () => { textMode = 'cut'; updateModeUI(); });
-
-  const sideTopBtn = document.getElementById('text-side-top');
-  const sideBottomBtn = document.getElementById('text-side-bottom');
-  sideTopBtn.addEventListener('click', () => {
-    textSide = 'top';
-    sideTopBtn.classList.add('active');
-    sideBottomBtn.classList.remove('active');
-  });
-  sideBottomBtn.addEventListener('click', () => {
-    textSide = 'bottom';
-    sideBottomBtn.classList.add('active');
-    sideTopBtn.classList.remove('active');
-  });
-
   ['text-content', 'text-size', 'text-scalex', 'text-spacing', 'text-font'].forEach(id => {
     document.getElementById(id).addEventListener('input', render);
   });
@@ -610,30 +930,42 @@ function flattenGlyphContours(glyph, penX, originY, fontSizeMm, scaleX) {
   const contours = [];
   let current = null;
   let cx = 0, cy = 0;
+  // Some fonts' TrueType outlines (via opentype.js) emit a redundant
+  // zero-length "L" command right after a curve that already ended at that
+  // same point (seen e.g. in "e"/"t" of several bundled fonts) - pushing it
+  // through unfiltered leaves a degenerate zero-length edge in the flattened
+  // contour, which OpenCascade's face-builder rejects as a self-intersecting
+  // wire even though the polygon never actually crosses itself. Skipping
+  // (near-)duplicate consecutive points here fixes that at the source.
+  function addPoint(x, y) {
+    const last = current[current.length - 1];
+    if (last && Math.hypot(last.x - x, last.y - y) < 1e-6) return;
+    current.push({ x, y });
+  }
   path.commands.forEach((cmd) => {
     if (cmd.type === 'M') {
       current = [{ x: cmd.x, y: cmd.y }];
       contours.push(current);
       cx = cmd.x; cy = cmd.y;
     } else if (cmd.type === 'L') {
-      current.push({ x: cmd.x, y: cmd.y });
+      addPoint(cmd.x, cmd.y);
       cx = cmd.x; cy = cmd.y;
     } else if (cmd.type === 'Q') {
       for (let t = 1; t <= TEXT_CURVE_STEPS; t++) {
         const tt = t / TEXT_CURVE_STEPS, mt = 1 - tt;
-        current.push({
-          x: mt * mt * cx + 2 * mt * tt * cmd.x1 + tt * tt * cmd.x,
-          y: mt * mt * cy + 2 * mt * tt * cmd.y1 + tt * tt * cmd.y,
-        });
+        addPoint(
+          mt * mt * cx + 2 * mt * tt * cmd.x1 + tt * tt * cmd.x,
+          mt * mt * cy + 2 * mt * tt * cmd.y1 + tt * tt * cmd.y,
+        );
       }
       cx = cmd.x; cy = cmd.y;
     } else if (cmd.type === 'C') {
       for (let t = 1; t <= TEXT_CURVE_STEPS; t++) {
         const tt = t / TEXT_CURVE_STEPS, mt = 1 - tt;
-        current.push({
-          x: mt * mt * mt * cx + 3 * mt * mt * tt * cmd.x1 + 3 * mt * tt * tt * cmd.x2 + tt * tt * tt * cmd.x,
-          y: mt * mt * mt * cy + 3 * mt * mt * tt * cmd.y1 + 3 * mt * tt * tt * cmd.y2 + tt * tt * tt * cmd.y,
-        });
+        addPoint(
+          mt * mt * mt * cx + 3 * mt * mt * tt * cmd.x1 + 3 * mt * tt * tt * cmd.x2 + tt * tt * tt * cmd.x,
+          mt * mt * mt * cy + 3 * mt * mt * tt * cmd.y1 + 3 * mt * tt * tt * cmd.y2 + tt * tt * tt * cmd.y,
+        );
       }
       cx = cmd.x; cy = cmd.y;
     } else if (cmd.type === 'Z' && current && current.length > 1) {
@@ -724,6 +1056,22 @@ function textToShapePieces(font, text, originX, originY, fontSizeMm, scaleXPerce
   return pieces;
 }
 
+// Reads the current Text-panel settings into a plain object - stored on each
+// placed shape as `textParams` so the whole group can be reopened later (see
+// openTextEditor()) without having to reverse-engineer settings from baked
+// glyph outlines.
+function currentTextParams(originPoint) {
+  return {
+    text: document.getElementById('text-content').value,
+    fontKey: document.getElementById('text-font').value,
+    fontSize: Math.max(0.5, parseFloat(document.getElementById('text-size').value) || 15),
+    scaleXPercent: parseFloat(document.getElementById('text-scalex').value) || 100,
+    spacing: parseFloat(document.getElementById('text-spacing').value) || 0,
+    originX: originPoint.x,
+    originY: originPoint.y,
+  };
+}
+
 // Reads the current Text-panel settings and generates shape pieces at the
 // given world point (baseline start). Returns [] if fonts aren't loaded yet,
 // no font is selected, or the text field is empty.
@@ -732,11 +1080,93 @@ function currentTextPieces(originPoint) {
   const font = loadedTextFonts[document.getElementById('text-font').value];
   const text = document.getElementById('text-content').value;
   if (!font || !text) return [];
-  const fontSize = Math.max(0.5, parseFloat(document.getElementById('text-size').value) || 15);
-  const scaleXPercent = parseFloat(document.getElementById('text-scalex').value) || 100;
-  const spacing = parseFloat(document.getElementById('text-spacing').value) || 0;
-  return textToShapePieces(font, text, originPoint.x, originPoint.y, fontSize, scaleXPercent, spacing);
+  const p = currentTextParams(originPoint);
+  return textToShapePieces(font, text, originPoint.x, originPoint.y, p.fontSize, p.scaleXPercent, p.spacing);
 }
+
+// Shown while actively placing new text (currentTool === 'text') or editing an
+// existing group (textEditGroupId set) - mirrors updatePolygonPanelVisibility.
+function updateTextPanelVisibility() {
+  // A shape can be deleted (or undone) while its editor is open - drop the
+  // stale reference instead of letting "Änderungen übernehmen" silently do
+  // nothing/throw.
+  if (textEditGroupId != null && !shapes.some(s => s.groupId === textEditGroupId && s.kind === 'text')) {
+    textEditGroupId = null;
+  }
+  const editing = textEditGroupId != null;
+  document.getElementById('text-panel-block').style.display = (currentTool === 'text' || editing) ? 'block' : 'none';
+  document.getElementById('text-edit-actions').style.display = editing ? 'flex' : 'none';
+  // Committing the whole model mid-text-edit would apply the sketch as it
+  // stood before this edit (the group's old glyph shapes are only swapped
+  // out for the new ones on "Änderungen übernehmen") - block that until the
+  // edit is finished or cancelled, same as the Text panel's own apply/cancel
+  // pair being the only way out of edit mode.
+  btnExtrude.disabled = editing;
+}
+
+// Opens the panel bound to an existing text group, pre-filled from the
+// `textParams` stored on its shapes when they were created (or last edited) -
+// see the placement handler and btn-text-apply below. Older projects saved
+// before this field existed have no textParams on their text shapes, so
+// those groups simply have no "Bearbeiten" button (see renderShapeList).
+function openTextEditor(groupId) {
+  const shape = shapes.find(s => s.groupId === groupId && s.kind === 'text');
+  if (!shape || !shape.textParams) return;
+  const p = shape.textParams;
+  document.getElementById('text-content').value = p.text;
+  document.getElementById('text-font').value = p.fontKey;
+  document.getElementById('text-size').value = p.fontSize;
+  document.getElementById('text-scalex').value = p.scaleXPercent;
+  document.getElementById('text-spacing').value = p.spacing;
+  textEditGroupId = groupId;
+  updateTextPanelVisibility();
+  render();
+}
+
+document.getElementById('btn-text-apply').addEventListener('click', () => {
+  const groupId = textEditGroupId;
+  const oldMembers = shapes.filter(s => s.groupId === groupId && s.kind === 'text');
+  if (oldMembers.length === 0) { textEditGroupId = null; updateTextPanelVisibility(); return; }
+  const origin = { x: oldMembers[0].textParams.originX, y: oldMembers[0].textParams.originY };
+  const pieces = currentTextPieces(origin);
+  if (pieces.length === 0) return; // empty text field - keep the group as-is until it names something again
+  pushHistory();
+  // Height/side/mode aren't read from the (hidden-while-editing) panel
+  // fields here - they're carried over as-is from the group's current
+  // shapes, which the Formen-Liste row's own Loch/Aufaddieren/Höhe/Oben-Unten
+  // controls already keep in sync across every member (see shapesInGroup).
+  const { isHole, isAdditive, additiveHeight, additiveSide, holeDepth } = oldMembers[0];
+  const textParams = currentTextParams(origin);
+  oldMembers.forEach(sh => selectedShapeIds.delete(sh.id));
+  shapes = shapes.filter(s => s.groupId !== groupId);
+  pieces.forEach(piece => {
+    shapes.push({
+      id: nextShapeId++,
+      type: 'polygon',
+      kind: 'text',
+      char: piece.char,
+      groupId,
+      points: piece.points,
+      isHole,
+      isAdditive,
+      additiveHeight,
+      additiveSide,
+      holeDepth,
+      textParams,
+    });
+  });
+  selectedShapeIds = new Set(shapes.filter(s => s.groupId === groupId).map(s => s.id));
+  textEditGroupId = null;
+  onShapesChanged();
+  updateTextPanelVisibility();
+  render();
+});
+
+document.getElementById('btn-text-cancel').addEventListener('click', () => {
+  textEditGroupId = null;
+  updateTextPanelVisibility();
+  render();
+});
 
 // Distance along a ray at the given angle from one grid line crossing to the next: for
 // axis-aligned angles that's just the grid size, but for a diagonal it's larger since the
@@ -930,6 +1360,7 @@ function render() {
   if (currentTool === 'edge') drawEdgeHandles();
   if (currentTool === 'select') drawBackgroundImageHandles();
   if (currentTool === 'lineselect') drawLineSelectHandles();
+  if (currentTool === 'alignline') drawAlignLineHandles();
   if (currentTool === 'line' || currentTool === 'lineselect') drawOpenShapeEnds();
   drawDragLabel();
 
@@ -1047,7 +1478,15 @@ function render() {
   // in-progress rectangle / regular polygon
   if (isShapeTool(currentTool) && shapeStartPoint && mousePos) {
     const p = snap(mousePos);
-    const pts = shapeToolPoints(currentTool, shapeStartPoint, p);
+    let pts = shapeToolPoints(currentTool, shapeStartPoint, p);
+    if (currentTool === 'polygon') {
+      const fillet = polygonToolFillet();
+      if (fillet > 0) {
+        const filletRadii = {};
+        for (let i = 0; i < pts.length; i++) filletRadii[i] = fillet;
+        pts = getOutlinePoints({ type: 'polygon', points: pts, filletRadii });
+      }
+    }
     ctx.strokeStyle = '#4a7dfc';
     ctx.lineWidth = 2 / viewScale;
     ctx.beginPath();
@@ -1069,10 +1508,10 @@ function render() {
   }
 
   // text tool preview: ghost outline of the text at the (snapped) cursor position
-  if (currentTool === 'text' && mousePos) {
+  if (currentTool === 'text' && textEditGroupId == null && mousePos) {
     const p = snap(mousePos);
     const pieces = currentTextPieces(p);
-    ctx.strokeStyle = textMode === 'cut' ? '#cc8b2c' : '#4a9eff';
+    ctx.strokeStyle = '#4a9eff'; // matches the additive/blue default every new shape starts as - see the placement handler below
     ctx.lineWidth = 2 / viewScale;
     ctx.setLineDash([5 / viewScale, 3 / viewScale]);
     pieces.forEach(piece => {
@@ -1108,7 +1547,7 @@ function render() {
   // placed center, recomputed from the panel's current values every frame -
   // same "just re-derive it" approach as the rect/poly-N preview above.
   if ((currentTool === 'splineprofile' && splineProfileCenter) || splineProfileEditId != null) {
-    const result = computeSplineProfile(readSplineProfileParams());
+    const result = computeSplineProfileForStandard(readSplineProfileParams());
     if (result.points) {
       ctx.strokeStyle = '#4a9eff';
       ctx.lineWidth = 2 / viewScale;
@@ -1381,6 +1820,43 @@ function drawLineSelectHandles() {
   ctx.restore();
 }
 
+// "Linie ausrichten" tool: highlights every clickable line (closed-polygon
+// edges only, same restriction as lineselect - an open shape's phantom
+// closing edge isn't a real line) so it's clear what can be picked, then
+// draws the already-picked guide line on top in a distinct color while
+// waiting for the follow-line click.
+function drawAlignLineHandles() {
+  ctx.save();
+  ctx.strokeStyle = '#37e6b3';
+  ctx.lineWidth = 3 / viewScale;
+  shapes.forEach(s => {
+    if (s.type !== 'polygon' || s.open) return;
+    for (let j = 0; j < s.points.length; j++) {
+      const a = s.points[j];
+      const b = s.points[(j + 1) % s.points.length];
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+  });
+  ctx.restore();
+  if (!alignGuideSeg) return;
+  const s = shapes.find(sh => sh.id === alignGuideSeg.shapeId);
+  if (!s || s.type !== 'polygon') return;
+  const n = s.points.length;
+  const a = s.points[alignGuideSeg.segIndex];
+  const b = s.points[(alignGuideSeg.segIndex + 1) % n];
+  ctx.save();
+  ctx.strokeStyle = '#ff5f5f';
+  ctx.lineWidth = 4 / viewScale;
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+  ctx.restore();
+}
+
 // Marks the two open ends of every open shape (see drawShape) with a dot, so
 // the user can see where to click with the line tool to continue/re-close them.
 function drawOpenShapeEnds() {
@@ -1448,11 +1924,9 @@ const TOOL_SHORTCUTS = {
     ['Klick', 'Erste Ecke setzen'],
     ['Klick', 'Gegenüberliegende Ecke setzen'],
   ],
-  poly3: [['Klick', 'Mittelpunkt setzen'], ['Ziehen + Klick', 'Radius und Ausrichtung festlegen']],
-  poly5: [['Klick', 'Mittelpunkt setzen'], ['Ziehen + Klick', 'Radius und Ausrichtung festlegen']],
-  poly6: [['Klick', 'Mittelpunkt setzen'], ['Ziehen + Klick', 'Radius und Ausrichtung festlegen']],
-  poly8: [['Klick', 'Mittelpunkt setzen'], ['Ziehen + Klick', 'Radius und Ausrichtung festlegen']],
-  text: [['Rechts', 'Schriftart/Größe/Höhe einstellen'], ['Klick', 'Linker Rand der Grundlinie']],
+  polygon: [['Rechts', 'Anzahl Ecken einstellen'], ['Klick', 'Mittelpunkt setzen'], ['Ziehen + Klick', 'Radius und Ausrichtung festlegen']],
+  heart: [['Klick', 'Mittelpunkt setzen'], ['Ziehen + Klick', 'Größe festlegen']],
+  text: [['Rechts', 'Schriftart/Größe/Breite einstellen'], ['Klick', 'Linker Rand der Grundlinie']],
   holecircle: [['Rechts', 'Radius/Anzahl/Durchmesser einstellen'], ['Klick', 'Mittelpunkt setzen (wechselt danach ins Punkte-Tool)']],
   select: [
     ['Klick', 'Form auswählen/verschieben'],
@@ -1475,6 +1949,11 @@ const TOOL_SHORTCUTS = {
     ['Klick + Ziehen', 'Nur den Marker verschieben - Form bleibt an Ort und Stelle (rastet auf dem Snap-Raster ein)'],
   ],
   edge: [['Klick nahe Ecke', 'Rundungsradius eingeben (0/leer = scharfe Ecke)']],
+  alignline: [
+    ['Klick', 'Leitlinie wählen (Linie einer geschlossenen Form)'],
+    ['Klick', 'Follow-Linie wählen - deren Objekt dreht sich um seinen Mittelpunkt, bis beide Linien parallel sind'],
+    ['Escape', 'Gewählte Leitlinie verwerfen'],
+  ],
   edge3d: [
     ['Klick auf 3D-Kante', 'Rundungsradius (Fillet) eingeben, Enter übernimmt'],
     ['Escape', 'Auswahl der Kante verwerfen'],
@@ -1507,12 +1986,15 @@ function setTool(tool) {
   }
   document.querySelectorAll('.tool').forEach(b => b.classList.remove('active'));
   document.getElementById('tool-' + tool).classList.add('active');
-  document.getElementById('text-panel-block').style.display = (tool === 'text') ? 'block' : 'none';
   document.getElementById('holecircle-panel-block').style.display = (tool === 'holecircle') ? 'block' : 'none';
+  textEditGroupId = null;
+  updateTextPanelVisibility();
+  polygonEditId = null;
+  updatePolygonPanelVisibility();
   splineProfileEditId = null;
   updateSplineProfilePanelVisibility();
   if (tool !== 'lineselect') selectedSegment = null;
-  canvas.style.cursor = (tool === 'select' || tool === 'lineselect' || tool === 'dimension' || tool === 'point' || tool === 'centerpoint' || tool === 'edge' || tool === 'origin') ? 'pointer' : 'crosshair';
+  canvas.style.cursor = (tool === 'select' || tool === 'lineselect' || tool === 'dimension' || tool === 'point' || tool === 'centerpoint' || tool === 'edge' || tool === 'origin' || tool === 'alignline') ? 'pointer' : 'crosshair';
   updateToolShortcuts();
   render();
 }
@@ -1540,6 +2022,7 @@ function cancelInProgress() {
   angleLockAngle = null;
   angleLockSnapHit = null;
   angleLockAlignFrom = null;
+  alignGuideSeg = null;
 }
 
 // The additiveSide ('top'/'bottom'/'center') a freshly drawn shape should
@@ -1770,8 +2253,17 @@ function centerView() {
   viewOffset = { x: canvas.clientWidth / 2, y: canvas.clientHeight / 2 };
 }
 
+// How many mm of width the starting/reset zoom aims to show across the
+// current canvas - a fixed 100% (1 screen px = 1 mm) leaves small parts
+// (the common case here: text, small hole patterns, ...) looking tiny on a
+// wide canvas, so this scales with the canvas instead of a flat 1.
+const DEFAULT_VIEW_WIDTH_MM = 50;
+function defaultViewScale() {
+  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, canvas.clientWidth / DEFAULT_VIEW_WIDTH_MM));
+}
+
 document.getElementById('btn-reset-view').addEventListener('click', () => {
-  viewScale = 1;
+  viewScale = defaultViewScale();
   centerView();
   render();
 });
@@ -2183,19 +2675,38 @@ canvas.addEventListener('click', (evt) => {
     } else {
       if (p.x !== shapeStartPoint.x || p.y !== shapeStartPoint.y) {
         pushHistory();
-        shapes.push({ id: nextShapeId++, type: 'polygon', kind: currentTool, points: shapeToolPoints(currentTool, shapeStartPoint, p), isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: defaultAdditiveSide(), holeDepth: 5 });
+        const pts = shapeToolPoints(currentTool, shapeStartPoint, p);
+        const shape = { id: nextShapeId++, type: 'polygon', kind: currentTool, points: pts, isHole: false, isAdditive: true, additiveHeight: 5, additiveSide: defaultAdditiveSide(), holeDepth: 5 };
+        if (currentTool === 'polygon') {
+          const sides = polygonToolSides();
+          shape.sides = sides;
+          shape.centerX = shapeStartPoint.x;
+          shape.centerY = shapeStartPoint.y;
+          shape.radius = dist(shapeStartPoint, p);
+          // pts[0] sits exactly at the (possibly angle-grid-snapped) placement
+          // angle - see regularPolygonPoints - so this reflects the angle the
+          // shape was actually built with rather than the raw mouse angle.
+          shape.rotation = Math.atan2(pts[0].y - shapeStartPoint.y, pts[0].x - shapeStartPoint.x);
+          const fillet = polygonToolFillet();
+          if (fillet > 0) {
+            shape.filletRadii = {};
+            for (let i = 0; i < sides; i++) shape.filletRadii[i] = fillet;
+          }
+        }
+        shapes.push(shape);
         onShapesChanged();
       }
       shapeStartPoint = null;
     }
     render();
-  } else if (currentTool === 'text') {
+  } else if (currentTool === 'text' && textEditGroupId == null) {
     const p = snap(raw);
     const pieces = currentTextPieces(p);
     if (pieces.length > 0) {
       pushHistory();
       const groupId = nextShapeId;
-      const heightVal = Math.max(0.1, parseFloat(document.getElementById('text-height').value) || 3);
+      const textParams = currentTextParams(p);
+      const side = defaultAdditiveSide();
       pieces.forEach(piece => {
         shapes.push({
           id: nextShapeId++,
@@ -2204,11 +2715,12 @@ canvas.addEventListener('click', (evt) => {
           char: piece.char,
           groupId,
           points: piece.points,
-          isHole: textMode === 'cut',
-          isAdditive: textMode === 'extrude',
-          additiveHeight: heightVal,
-          additiveSide: textSide,
-          holeDepth: heightVal,
+          isHole: false,
+          isAdditive: true,
+          additiveHeight: 5,
+          additiveSide: side,
+          holeDepth: 5,
+          textParams,
         });
       });
       onShapesChanged();
@@ -2281,6 +2793,22 @@ canvas.addEventListener('click', (evt) => {
       selectedSegment = { shapeId: hit.shape.id, segIndex: hit.segIndex };
     } else {
       selectedSegment = null;
+    }
+    render();
+  } else if (currentTool === 'alignline') {
+    // Same closed-polygon-only restriction as lineselect (see above) - a line
+    // needs two real endpoints to have a direction.
+    const hit = hitTestSegment(raw);
+    const valid = hit && hit.shape.type === 'polygon' && hit.segIndex !== null && !hit.shape.open;
+    if (!alignGuideSeg) {
+      alignGuideSeg = valid ? { shapeId: hit.shape.id, segIndex: hit.segIndex } : null;
+    } else if (valid && hit.shape.id === alignGuideSeg.shapeId && hit.segIndex === alignGuideSeg.segIndex) {
+      alignGuideSeg = null; // clicking the guide line again deselects it
+    } else if (valid) {
+      performAlignLine(alignGuideSeg, { shapeId: hit.shape.id, segIndex: hit.segIndex });
+      alignGuideSeg = null;
+    } else {
+      alignGuideSeg = null;
     }
     render();
   }
@@ -3155,14 +3683,25 @@ function openFilletEditor(hit) {
 // Shape list panel
 // ===========================================================================
 
-const SHAPE_KIND_LABELS = { rect: 'Rechteck', poly3: 'Dreieck', poly5: 'Fünfeck', poly6: 'Sechseck', poly8: 'Achteck', text: 'Text' };
+// poly3/poly5/poly6/poly8 remain here only for shapes saved by older versions
+// (before the fixed-corner-count tools were unified into the "Polygon" tool
+// below) - so files saved with those tools keep showing the right label.
+const SHAPE_KIND_LABELS = { rect: 'Rechteck', poly3: 'Dreieck', poly5: 'Fünfeck', poly6: 'Sechseck', poly8: 'Achteck', heart: 'Herz', text: 'Text' };
 
 function shapeLabel(s) {
   if (s.kind === 'holecircle') return 'Lochkreis-Loch';
   if (s.type === 'circle') return 'Kreis';
-  if (s.kind === 'text') return `Text „${s.char}“`;
+  if (s.kind === 'polygon') return `Polygon (${s.sides || s.points.length}-Eck)${s.open ? ' (offen)' : ''}`;
+  if (s.kind === 'text') return `Text „${s.textParams ? s.textParams.text : s.char}“`;
   if (s.kind === 'splineprofile' && s.splineParams) {
-    return `Vielkeilprofil (${s.splineParams.internal ? 'innen' : 'außen'}, z=${s.splineParams.teeth}, m=${s.splineParams.module})`;
+    const p = s.splineParams;
+    const standardLabel = { din5480: 'DIN 5480', iso4156: 'ISO 4156', din5481: 'DIN 5481', iso14: 'ISO 14' }[p.standard] || 'benutzerdef.';
+    const side = p.internal ? 'innen' : 'außen';
+    if (p.standard === 'din5481' || p.standard === 'iso14') {
+      return `Vielkeilprofil (${standardLabel}, ${side}, z=${p.teeth})`;
+    }
+    const m = Number.isFinite(p.module) ? p.module.toFixed(3).replace(/\.?0+$/, '') : '?';
+    return `Vielkeilprofil (${standardLabel}, ${side}, z=${p.teeth}, m=${m})`;
   }
   const base = SHAPE_KIND_LABELS[s.kind] || 'Linienform';
   return s.open ? base + ' (offen)' : base;
@@ -3231,6 +3770,40 @@ function shapesInGroup(s) {
   return s.groupId != null ? shapes.filter(sh => sh.groupId === s.groupId) : [s];
 }
 
+// "Linie ausrichten" tool: rotates the follow line's whole shape (plus its
+// group-mates, e.g. text letters or a hole-circle pattern) around its own
+// center/pivot marker - the same pivot convention as the R+drag rotate in the
+// Objekt-tool, see updateRotateDrag() - by whatever angle makes the follow
+// line parallel to the guide line. A line's direction is only defined mod
+// 180° (it has no arrow), so the smallest such rotation is used.
+function performAlignLine(guideSeg, followSeg) {
+  const guideShape = shapes.find(s => s.id === guideSeg.shapeId);
+  const followShape = shapes.find(s => s.id === followSeg.shapeId);
+  if (!guideShape || !followShape) return;
+  // If both lines belong to the same object (or the same group, e.g. two
+  // letters of one text), rotating the follow shape would drag the guide
+  // line along with it and the two could never converge.
+  if (guideShape.id === followShape.id || (guideShape.groupId != null && guideShape.groupId === followShape.groupId)) {
+    alert('Leitlinie und Follow-Linie gehören zum selben Objekt - das lässt sich nicht ausrichten.');
+    return;
+  }
+  const gn = guideShape.points.length;
+  const ga = guideShape.points[guideSeg.segIndex];
+  const gb = guideShape.points[(guideSeg.segIndex + 1) % gn];
+  const fn = followShape.points.length;
+  const fa = followShape.points[followSeg.segIndex];
+  const fb = followShape.points[(followSeg.segIndex + 1) % fn];
+  const guideDeg = (Math.atan2(gb.y - ga.y, gb.x - ga.x) * 180) / Math.PI;
+  const followDeg = (Math.atan2(fb.y - fa.y, fb.x - fa.x) * 180) / Math.PI;
+  let deltaDeg = ((guideDeg - followDeg) % 180 + 180) % 180;
+  if (deltaDeg > 90) deltaDeg -= 180;
+  if (Math.abs(deltaDeg) < 1e-9) return; // already parallel
+  const pivot = followShape.groupId != null ? groupPivotOf(followShape.groupId) : effectivePivot(followShape);
+  pushHistory();
+  shapesInGroup(followShape).forEach(sh => rotateShapeAround(sh, pivot, deltaDeg));
+  onShapesChanged();
+}
+
 function renderShapeList() {
   btnExportDxf.disabled = shapes.length === 0;
   shapeListEl.innerHTML = '';
@@ -3238,14 +3811,28 @@ function renderShapeList() {
     shapeListEl.innerHTML = '<div class="empty">Noch keine Formen gezeichnet.</div>';
     return;
   }
-  shapes.forEach((s, idx) => {
+  // A placed text is many polygon shapes (one per glyph piece) sharing one
+  // groupId - shown here as a single row (see shapeLabel's textParams.text)
+  // so the list reads as "one form" per the user's mental model, matching
+  // how it's edited (openTextEditor) and deleted (whole group) below.
+  const seenTextGroups = new Set();
+  let visibleIdx = 0;
+  shapes.forEach((s) => {
+    if (s.kind === 'text' && s.groupId != null) {
+      if (seenTextGroups.has(s.groupId)) return;
+      seenTextGroups.add(s.groupId);
+    }
+    visibleIdx++;
+    const isSelected = s.kind === 'text' && s.groupId != null
+      ? shapesInGroup(s).some(sh => selectedShapeIds.has(sh.id))
+      : selectedShapeIds.has(s.id);
     const item = document.createElement('div');
-    item.className = 'shape-item' + (s.isHole ? ' hole' : '') + (s.isAdditive ? ' additive' : '') + (selectedShapeIds.has(s.id) ? ' selected' : '');
+    item.className = 'shape-item' + (s.isHole ? ' hole' : '') + (s.isAdditive ? ' additive' : '') + (isSelected ? ' selected' : '');
 
     const row = document.createElement('div');
     row.className = 'shape-item-row';
     const label = document.createElement('span');
-    label.textContent = `${idx + 1}. ${shapeLabel(s)}`;
+    label.textContent = `${visibleIdx}. ${shapeLabel(s)}`;
     row.appendChild(label);
 
     const controls = document.createElement('span');
@@ -3306,21 +3893,39 @@ function renderShapeList() {
       editBtn.addEventListener('click', () => openSplineProfileEditor(s.id));
       controls.appendChild(editBtn);
     }
+    if (s.kind === 'polygon' && s.centerX != null) {
+      const editBtn = document.createElement('button');
+      editBtn.textContent = '✏ Bearbeiten';
+      editBtn.title = 'Eckenzahl und Rundung dieses Polygons nachträglich ändern';
+      editBtn.addEventListener('click', () => openPolygonEditor(s.id));
+      controls.appendChild(editBtn);
+    }
+    if (s.kind === 'text' && s.textParams) {
+      const editBtn = document.createElement('button');
+      editBtn.textContent = '✏ Bearbeiten';
+      editBtn.title = 'Text, Schriftart und weitere Einstellungen nachträglich ändern';
+      editBtn.addEventListener('click', () => openTextEditor(s.groupId));
+      controls.appendChild(editBtn);
+    }
 
     const delBtn = document.createElement('button');
     delBtn.textContent = '✕';
     delBtn.title = 'Form löschen';
-    delBtn.addEventListener('click', () => deleteShape(s.id));
+    delBtn.addEventListener('click', () => {
+      if (s.kind === 'text' && s.groupId != null) deleteShapes(shapesInGroup(s).map(sh => sh.id));
+      else deleteShape(s.id);
+    });
     controls.appendChild(delBtn);
 
     row.appendChild(controls);
     row.addEventListener('click', (e) => {
       if (e.target === delBtn || e.target === holeCheckbox || e.target === addCheckbox) return;
+      const rowIds = s.kind === 'text' && s.groupId != null ? shapesInGroup(s).map(sh => sh.id) : [s.id];
       if (e.ctrlKey || e.metaKey) {
-        if (selectedShapeIds.has(s.id)) selectedShapeIds.delete(s.id);
-        else selectedShapeIds.add(s.id);
+        if (rowIds.every(id => selectedShapeIds.has(id))) rowIds.forEach(id => selectedShapeIds.delete(id));
+        else rowIds.forEach(id => selectedShapeIds.add(id));
       } else {
-        selectedShapeIds = new Set([s.id]);
+        selectedShapeIds = new Set(rowIds);
       }
       renderShapeList();
       render();
@@ -3469,10 +4074,8 @@ function renderShapeList() {
 document.getElementById('tool-line').addEventListener('click', () => setTool('line'));
 document.getElementById('tool-circle').addEventListener('click', () => setTool('circle'));
 document.getElementById('tool-rect').addEventListener('click', () => setTool('rect'));
-document.getElementById('tool-poly3').addEventListener('click', () => setTool('poly3'));
-document.getElementById('tool-poly5').addEventListener('click', () => setTool('poly5'));
-document.getElementById('tool-poly6').addEventListener('click', () => setTool('poly6'));
-document.getElementById('tool-poly8').addEventListener('click', () => setTool('poly8'));
+document.getElementById('tool-polygon').addEventListener('click', () => setTool('polygon'));
+document.getElementById('tool-heart').addEventListener('click', () => setTool('heart'));
 document.getElementById('tool-text').addEventListener('click', () => setTool('text'));
 document.getElementById('tool-holecircle').addEventListener('click', () => setTool('holecircle'));
 document.getElementById('tool-splineprofile').addEventListener('click', () => setTool('splineprofile'));
@@ -3483,6 +4086,7 @@ document.getElementById('tool-origin').addEventListener('click', () => setTool('
 document.getElementById('tool-point').addEventListener('click', () => setTool('point'));
 document.getElementById('tool-centerpoint').addEventListener('click', () => setTool('centerpoint'));
 document.getElementById('tool-edge').addEventListener('click', () => setTool('edge'));
+document.getElementById('tool-alignline').addEventListener('click', () => setTool('alignline'));
 document.getElementById('tool-edge3d').addEventListener('click', () => setTool('edge3d'));
 
 updateToolShortcuts(); // reflect the initial tool ('line') before any button is clicked
@@ -3499,6 +4103,13 @@ updateToolShortcuts(); // reflect the initial tool ('line') before any button is
 // ===========================================================================
 
 const splineProfileEls = {
+  standard: document.getElementById('splineprofile-standard'),
+  groupCustom: document.getElementById('splineprofile-group-custom'),
+  groupDin5480: document.getElementById('splineprofile-group-din5480'),
+  groupIso4156: document.getElementById('splineprofile-group-iso4156'),
+  groupDin5481: document.getElementById('splineprofile-group-din5481'),
+  groupIso14: document.getElementById('splineprofile-group-iso14'),
+  shiftRow: document.getElementById('splineprofile-shift-row'),
   internalBtn: document.getElementById('splineprofile-mode-internal'),
   externalBtn: document.getElementById('splineprofile-mode-external'),
   centerX: document.getElementById('splineprofile-center-x'),
@@ -3506,6 +4117,20 @@ const splineProfileEls = {
   teeth: document.getElementById('splineprofile-teeth'),
   module: document.getElementById('splineprofile-module'),
   pressureAngle: document.getElementById('splineprofile-pressure-angle'),
+  dinReferenceDiameter: document.getElementById('splineprofile-din-reference-diameter'),
+  dinModule: document.getElementById('splineprofile-din-module'),
+  isoModule: document.getElementById('splineprofile-iso-module'),
+  isoPressureAngle: document.getElementById('splineprofile-iso-pressure-angle'),
+  din5481NominalDiameter: document.getElementById('splineprofile-din5481-nominal-diameter'),
+  din5481TipDiameter: document.getElementById('splineprofile-din5481-tip-diameter'),
+  din5481RootDiameter: document.getElementById('splineprofile-din5481-root-diameter'),
+  din5481GapAngle: document.getElementById('splineprofile-din5481-gap-angle'),
+  din5481TipFlat: document.getElementById('splineprofile-din5481-tip-flat'),
+  din5481RootFlat: document.getElementById('splineprofile-din5481-root-flat'),
+  iso14InnerDiameter: document.getElementById('splineprofile-iso14-inner-diameter'),
+  iso14OuterDiameter: document.getElementById('splineprofile-iso14-outer-diameter'),
+  iso14Width: document.getElementById('splineprofile-iso14-width'),
+  iso14TipFlat: document.getElementById('splineprofile-iso14-tip-flat'),
   rotation: document.getElementById('splineprofile-rotation'),
   shift: document.getElementById('splineprofile-shift'),
   tipDiameter: document.getElementById('splineprofile-tip-diameter'),
@@ -3515,30 +4140,183 @@ const splineProfileEls = {
   apply: document.getElementById('btn-splineprofile-apply'),
   cancel: document.getElementById('btn-splineprofile-cancel'),
   panel: document.getElementById('splineprofile-panel-block'),
+  computed: {
+    pitchAngle: document.getElementById('splineprofile-computed-pitchangle'),
+    pitch: document.getElementById('splineprofile-computed-pitch'),
+    base: document.getElementById('splineprofile-computed-base'),
+    tip: document.getElementById('splineprofile-computed-tip'),
+    root: document.getElementById('splineprofile-computed-root'),
+    circPitch: document.getElementById('splineprofile-computed-circpitch'),
+    pressure: document.getElementById('splineprofile-computed-pressure'),
+  },
 };
 
 // Reads the panel's current values into a plain params object (see
-// computeSplineProfile) - shared by the live preview and the apply handler
-// so they can never disagree about what "the current settings" mean.
+// computeSplineProfile/computeSerrationProfile/computeStraightSidedSplineProfile)
+// - shared by the live preview and the apply handler so they can never
+// disagree about what "the current settings" mean. The active Profilstandard
+// (splineProfileEls.standard) only decides WHICH fields are read from and
+// which generator computeSplineProfileForStandard() below dispatches to -
+// the involute generator itself is standard-agnostic and untouched, and the
+// two new straight-flank generators are equally standard-agnostic (see their
+// own file comments).
 function readSplineProfileParams() {
-  return {
+  const standard = splineProfileEls.standard.value;
+  const common = {
+    standard,
+    standardVersion: null, // prepared for a future specific edition/year per standard - not used yet, see task scope
     internal: splineProfileEls.internalBtn.classList.contains('active'),
     centerX: parseFloat(splineProfileEls.centerX.value),
     centerY: parseFloat(splineProfileEls.centerY.value),
     teeth: parseFloat(splineProfileEls.teeth.value),
+    rotation: parseFloat(splineProfileEls.rotation.value) || 0,
+    rootFillet: parseFloat(splineProfileEls.rootFillet.value) || 0,
+  };
+  if (standard === 'din5480') {
+    // DIN 5480: Zähnezahl + Bezugsdurchmesser are the two inputs, Modul is the
+    // uniquely-determined dependent value (module = referenceDiameter / teeth)
+    // - see the file note above computeSplineProfileForStandard() for why this
+    // avoids two simultaneously-editable values that could disagree.
+    const referenceDiameter = parseFloat(splineProfileEls.dinReferenceDiameter.value);
+    const module = (Number.isFinite(referenceDiameter) && Number.isFinite(common.teeth) && common.teeth > 0)
+      ? referenceDiameter / common.teeth : NaN;
+    return {
+      ...common,
+      standardComplianceStatus: 'geometryOnly',
+      profileShift: parseFloat(splineProfileEls.shift.value) || 0,
+      referenceDiameter,
+      module,
+      pressureAngle: 30, // fixed by DIN 5480 - shown, not editable (see panel)
+      tipDiameter: null, rootDiameter: null, // not offered for this standard - use the generator's own defaults
+    };
+  }
+  if (standard === 'iso4156') {
+    return {
+      ...common,
+      standardComplianceStatus: 'geometryOnly',
+      profileShift: parseFloat(splineProfileEls.shift.value) || 0,
+      module: parseFloat(splineProfileEls.isoModule.value),
+      pressureAngle: parseFloat(splineProfileEls.isoPressureAngle.value),
+      tipDiameter: null, rootDiameter: null, // not offered for this standard - use the generator's own defaults
+    };
+  }
+  if (standard === 'din5481') {
+    // DIN 5481 "Kerbverzahnung" - straight flanks, NOT an involute (see
+    // computeSerrationProfile). profileGeometryType records which of the two
+    // straight-flank generators produced the shape, mirroring how `standard`
+    // records which panel/parameter set was used.
+    return {
+      ...common,
+      standardComplianceStatus: 'geometryOnly',
+      profileGeometryType: 'straightSerration',
+      nominalDiameter: parseFloat(splineProfileEls.din5481NominalDiameter.value),
+      tipDiameter: parseFloat(splineProfileEls.din5481TipDiameter.value),
+      rootDiameter: parseFloat(splineProfileEls.din5481RootDiameter.value),
+      flankAngle: parseFloat(splineProfileEls.din5481GapAngle.value), // "Lückenwinkel" - see field title
+      tipFlat: parseFloat(splineProfileEls.din5481TipFlat.value) || 0,
+      rootFlat: parseFloat(splineProfileEls.din5481RootFlat.value) || 0,
+    };
+  }
+  if (standard === 'iso14') {
+    // ISO 14 straight-sided spline - straight flanks, NOT an involute (see
+    // computeStraightSidedSplineProfile).
+    return {
+      ...common,
+      standardComplianceStatus: 'geometryOnly',
+      profileGeometryType: 'straightSided',
+      innerDiameter: parseFloat(splineProfileEls.iso14InnerDiameter.value),
+      outerDiameter: parseFloat(splineProfileEls.iso14OuterDiameter.value),
+      toothWidth: parseFloat(splineProfileEls.iso14Width.value),
+      tipFlat: parseFloat(splineProfileEls.iso14TipFlat.value) || 0,
+    };
+  }
+  return {
+    ...common,
+    standard: 'custom',
+    standardComplianceStatus: 'custom',
+    profileShift: parseFloat(splineProfileEls.shift.value) || 0,
     module: parseFloat(splineProfileEls.module.value),
     pressureAngle: parseFloat(splineProfileEls.pressureAngle.value),
-    rotation: parseFloat(splineProfileEls.rotation.value) || 0,
-    profileShift: parseFloat(splineProfileEls.shift.value) || 0,
-    rootFillet: parseFloat(splineProfileEls.rootFillet.value) || 0,
     tipDiameter: parseFloat(splineProfileEls.tipDiameter.value) || null,
     rootDiameter: parseFloat(splineProfileEls.rootDiameter.value) || null,
   };
 }
 
+// Dispatches to whichever generator matches the active Profilstandard - the
+// involute generator (computeSplineProfile) for custom/DIN 5480/ISO 4156, or
+// one of the two straight-flank generators for DIN 5481/ISO 14 (see their
+// file comments - deliberately NOT involutes, per task). Also adds a
+// clearer, DIN-5480-specific message for the one involute failure mode
+// that's otherwise hard to attribute (an empty/invalid Bezugsdurchmesser
+// surfacing as a generic "Modul" error, even though Modul isn't an input
+// field in that mode) - everything else is delegated unchanged.
+function computeSplineProfileForStandard(params) {
+  if (params.standard === 'din5480') {
+    if (!Number.isFinite(params.referenceDiameter) || params.referenceDiameter <= 0) {
+      return { points: null, filletRadii: null, error: 'Bezugsdurchmesser muss größer als 0 sein.', computed: null };
+    }
+    if (!Number.isFinite(params.module) || params.module <= 0) {
+      return { points: null, filletRadii: null, error: 'Bezugsdurchmesser und Zähnezahl ergeben keinen gültigen Modul - beide Werte prüfen.', computed: null };
+    }
+  }
+  if (params.standard === 'din5481') return computeSerrationProfile(params);
+  if (params.standard === 'iso14') return computeStraightSidedSplineProfile(params);
+  return computeSplineProfile(params);
+}
+
+// Shows only the field group relevant to the selected Profilstandard -
+// values already typed into any group are left untouched (just hidden), so
+// switching back and forth doesn't lose them. Profilverschiebung only
+// applies to the involute-based standards (custom/DIN 5480/ISO 4156) - the
+// two straight-flank standards have no such concept, so its row is hidden
+// for those (per task: "Bei ISO 14 keine Profilverschiebung ... anzeigen").
+function updateSplineProfileStandardGroups() {
+  const standard = splineProfileEls.standard.value;
+  splineProfileEls.groupCustom.style.display = standard === 'custom' ? 'block' : 'none';
+  splineProfileEls.groupDin5480.style.display = standard === 'din5480' ? 'block' : 'none';
+  splineProfileEls.groupIso4156.style.display = standard === 'iso4156' ? 'block' : 'none';
+  splineProfileEls.groupDin5481.style.display = standard === 'din5481' ? 'block' : 'none';
+  splineProfileEls.groupIso14.style.display = standard === 'iso14' ? 'block' : 'none';
+  splineProfileEls.shiftRow.style.display = (standard === 'din5481' || standard === 'iso14') ? 'none' : 'block';
+}
+splineProfileEls.standard.addEventListener('change', () => {
+  updateSplineProfileStandardGroups();
+  ensureExplicitTipRootOrder();
+  updateSplineProfileStatus();
+});
+
+// Corrects a pair of explicit tip/root diameter fields (only if BOTH are
+// non-empty numbers - "automatisch"/blank fields are left alone, since the
+// generators' own default formulas already account for internal/external)
+// so they match the CURRENT Innen-/Außenverzahnung state: external needs
+// tip > root, internal needs root > tip (addendum/dedendum are swapped - see
+// computeSplineProfile/computeSerrationProfile). Without this, an explicit
+// pair typed for one direction is silently invalid for the other, so the
+// profile would simply stop rendering with only a small status message
+// explaining why. Deliberately re-checked (not just swapped once on toggle)
+// so it also self-corrects when the Profilstandard is switched while
+// Innenverzahnung was already active from a previous standard - see both
+// call sites below.
+function ensureTipRootOrderFor(tipEl, rootEl, internal) {
+  const tip = parseFloat(tipEl.value), root = parseFloat(rootEl.value);
+  if (!Number.isFinite(tip) || !Number.isFinite(root)) return;
+  const wrongOrder = internal ? !(root > tip) : !(tip > root);
+  if (wrongOrder) {
+    tipEl.value = root;
+    rootEl.value = tip;
+  }
+}
+function ensureExplicitTipRootOrder() {
+  const internal = splineProfileEls.internalBtn.classList.contains('active');
+  const standard = splineProfileEls.standard.value;
+  if (standard === 'din5481') ensureTipRootOrderFor(splineProfileEls.din5481TipDiameter, splineProfileEls.din5481RootDiameter, internal);
+  else if (standard === 'custom') ensureTipRootOrderFor(splineProfileEls.tipDiameter, splineProfileEls.rootDiameter, internal);
+}
+
 function setSplineProfileMode(internal) {
   splineProfileEls.externalBtn.classList.toggle('active', !internal);
   splineProfileEls.internalBtn.classList.toggle('active', internal);
+  ensureExplicitTipRootOrder();
   updateSplineProfileStatus();
 }
 splineProfileEls.externalBtn.addEventListener('click', () => setSplineProfileMode(false));
@@ -3551,16 +4329,39 @@ document.getElementById('splineprofile-angle-45').addEventListener('click', () =
 // Re-validates the current panel values (without creating/changing anything)
 // and shows a short message if they don't currently produce a valid profile -
 // same idea as the in-canvas red-dashed error shape for a failed extrude,
-// but for the not-yet-committed Vielkeilprofil panel.
+// but for the not-yet-committed Vielkeilprofil panel. Also refreshes the
+// DIN-5480 computed-Modul readout and the shared "Berechnete Werte" block.
 function updateSplineProfileStatus() {
-  const result = computeSplineProfile(readSplineProfileParams());
+  const params = readSplineProfileParams();
+  if (params.standard === 'din5480') {
+    splineProfileEls.dinModule.value = Number.isFinite(params.module) ? roundForDisplay(params.module) : '';
+  }
+  const result = computeSplineProfileForStandard(params);
   splineProfileEls.status.textContent = result.error || '';
+  const c = result.computed;
+  splineProfileEls.computed.pitchAngle.textContent = c ? roundForDisplay(c.pitchAngleDeg) : '–';
+  splineProfileEls.computed.pitch.textContent = c ? roundForDisplay(c.pitchDiameter) : '–';
+  splineProfileEls.computed.base.textContent = c ? roundForDisplay(c.baseDiameter) : '–';
+  splineProfileEls.computed.tip.textContent = c ? roundForDisplay(c.tipDiameter) : '–';
+  splineProfileEls.computed.root.textContent = c ? roundForDisplay(c.rootDiameter) : '–';
+  splineProfileEls.computed.circPitch.textContent = c ? roundForDisplay(c.circularPitch) : '–';
+  splineProfileEls.computed.pressure.textContent = c ? roundForDisplay(c.pressureAngleDeg) : '–';
   render();
 }
+// Same rounding the rest of the sketch uses for on-canvas mm labels (see
+// drawLiveLabel's toFixed(1) calls) - no new unit/rounding convention.
+function roundForDisplay(v) {
+  return Number.isFinite(v) ? v.toFixed(3).replace(/\.?0+$/, '') : '–';
+}
 [splineProfileEls.centerX, splineProfileEls.centerY, splineProfileEls.teeth, splineProfileEls.module,
- splineProfileEls.pressureAngle, splineProfileEls.rotation, splineProfileEls.shift,
+ splineProfileEls.pressureAngle, splineProfileEls.dinReferenceDiameter, splineProfileEls.isoModule,
+ splineProfileEls.din5481NominalDiameter, splineProfileEls.din5481TipDiameter, splineProfileEls.din5481RootDiameter,
+ splineProfileEls.din5481GapAngle, splineProfileEls.din5481TipFlat, splineProfileEls.din5481RootFlat,
+ splineProfileEls.iso14InnerDiameter, splineProfileEls.iso14OuterDiameter, splineProfileEls.iso14Width, splineProfileEls.iso14TipFlat,
+ splineProfileEls.rotation, splineProfileEls.shift,
  splineProfileEls.tipDiameter, splineProfileEls.rootDiameter, splineProfileEls.rootFillet]
   .forEach(el => el.addEventListener('input', updateSplineProfileStatus));
+splineProfileEls.isoPressureAngle.addEventListener('change', updateSplineProfileStatus);
 
 // Shown while actively placing a new profile (currentTool === 'splineprofile')
 // or editing an existing one (splineProfileEditId set) - see setTool() and
@@ -3574,6 +4375,7 @@ function updateSplineProfilePanelVisibility() {
   const show = currentTool === 'splineprofile' || splineProfileEditId != null;
   splineProfileEls.panel.style.display = show ? 'block' : 'none';
   if (!show) return;
+  updateSplineProfileStandardGroups();
   const editing = splineProfileEditId != null;
   splineProfileEls.apply.textContent = editing ? '✓ Änderungen übernehmen' : '✓ Profil erstellen';
   splineProfileEls.cancel.textContent = editing ? '✕ Fertig' : '✕ Abbrechen';
@@ -3582,22 +4384,47 @@ function updateSplineProfilePanelVisibility() {
 
 // Opens the panel bound to an existing 'splineprofile' shape, pre-filled from
 // its stored parameters (not re-derived from its baked points) - see the
-// shape's `splineParams` field, set in the apply handler below.
+// shape's `splineParams` field, set in the apply handler below. Shapes saved
+// before the Profilstandard feature existed have no `standard` field at all -
+// those are treated as 'custom' (see the datamodel note at the shape push
+// below), matching how they always behaved.
 function openSplineProfileEditor(shapeId) {
   const shape = shapes.find(s => s.id === shapeId);
   if (!shape || !shape.splineParams) return;
   const p = shape.splineParams;
+  const standard = p.standard || 'custom';
+  splineProfileEls.standard.value = standard;
+  updateSplineProfileStandardGroups();
   setSplineProfileMode(!!p.internal);
   splineProfileEls.centerX.value = p.centerX;
   splineProfileEls.centerY.value = p.centerY;
   splineProfileEls.teeth.value = p.teeth;
-  splineProfileEls.module.value = p.module;
-  splineProfileEls.pressureAngle.value = p.pressureAngle;
   splineProfileEls.rotation.value = p.rotation;
-  splineProfileEls.shift.value = p.profileShift;
+  if (p.profileShift != null) splineProfileEls.shift.value = p.profileShift;
   splineProfileEls.rootFillet.value = p.rootFillet;
-  splineProfileEls.tipDiameter.value = p.tipDiameter || '';
-  splineProfileEls.rootDiameter.value = p.rootDiameter || '';
+  if (standard === 'din5480') {
+    splineProfileEls.dinReferenceDiameter.value = p.referenceDiameter != null ? p.referenceDiameter : p.module * p.teeth;
+  } else if (standard === 'iso4156') {
+    splineProfileEls.isoModule.value = p.module;
+    splineProfileEls.isoPressureAngle.value = String(p.pressureAngle);
+  } else if (standard === 'din5481') {
+    splineProfileEls.din5481NominalDiameter.value = p.nominalDiameter;
+    splineProfileEls.din5481TipDiameter.value = p.tipDiameter;
+    splineProfileEls.din5481RootDiameter.value = p.rootDiameter;
+    splineProfileEls.din5481GapAngle.value = p.flankAngle;
+    splineProfileEls.din5481TipFlat.value = p.tipFlat || 0;
+    splineProfileEls.din5481RootFlat.value = p.rootFlat || 0;
+  } else if (standard === 'iso14') {
+    splineProfileEls.iso14InnerDiameter.value = p.innerDiameter;
+    splineProfileEls.iso14OuterDiameter.value = p.outerDiameter;
+    splineProfileEls.iso14Width.value = p.toothWidth;
+    splineProfileEls.iso14TipFlat.value = p.tipFlat || 0;
+  } else {
+    splineProfileEls.module.value = p.module;
+    splineProfileEls.pressureAngle.value = p.pressureAngle;
+    splineProfileEls.tipDiameter.value = p.tipDiameter || '';
+    splineProfileEls.rootDiameter.value = p.rootDiameter || '';
+  }
   splineProfileEditId = shapeId;
   updateSplineProfilePanelVisibility();
 }
@@ -3609,7 +4436,7 @@ splineProfileEls.apply.addEventListener('click', () => {
     splineProfileEls.status.textContent = 'Bitte zuerst einen Mittelpunkt in der Skizze anklicken.';
     return;
   }
-  const result = computeSplineProfile(params);
+  const result = computeSplineProfileForStandard(params);
   if (result.error) {
     splineProfileEls.status.textContent = result.error;
     return;
@@ -3779,6 +4606,20 @@ window.addEventListener('beforeunload', (evt) => {
 
 
 gridSizeInput.addEventListener('input', render);
+// Converts the displayed number so the actual (mm) grid size is unchanged
+// when switching units - only its display representation changes.
+let previousGridUnit = gridUnitInput.value;
+gridUnitInput.addEventListener('change', () => {
+  const v = parseFloat(gridSizeInput.value);
+  if (Number.isFinite(v)) {
+    const converted = previousGridUnit === 'mm' && gridUnitInput.value === 'in' ? v / MM_PER_INCH
+      : previousGridUnit === 'in' && gridUnitInput.value === 'mm' ? v * MM_PER_INCH
+      : v;
+    gridSizeInput.value = Math.round(converted * 10000) / 10000;
+  }
+  previousGridUnit = gridUnitInput.value;
+  render();
+});
 gridOnInput.addEventListener('change', render);
 angleStepInput.addEventListener('input', render);
 angleOnInput.addEventListener('change', render);
@@ -5895,6 +6736,7 @@ function exportFaceAsDxf(result) {
 // ===========================================================================
 
 resizeCanvas();
+viewScale = defaultViewScale();
 centerView();
 render();
 renderShapeList();

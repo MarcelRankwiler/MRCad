@@ -24,13 +24,17 @@
       </div>
       <div class="group">
         <label>Snap-Raster
-          <input type="number" id="grid-size" value="10" min="1" step="1" style="width:50px">
+          <input type="number" id="grid-size" value="1" min="0.01" step="1" style="width:50px">
+          <select id="grid-unit" title="Einheit der Rastergröße">
+            <option value="mm" selected>mm</option>
+            <option value="in">Zoll</option>
+          </select>
           <input type="checkbox" id="grid-on" checked>
         </label>
       </div>
       <div class="group">
         <label title="Beim Linien-Tool wird der Winkel zum vorherigen Punkt auf Vielfache dieses Werts eingerastet">Winkel-Raster
-          <input type="number" id="angle-step" value="45" min="1" max="180" step="1" style="width:45px">
+          <input type="number" id="angle-step" value="15" min="1" max="180" step="1" style="width:45px">
           <input type="checkbox" id="angle-on" checked>
         </label>
       </div>
@@ -41,11 +45,11 @@
       </div>
       <div class="group">
         <span id="zoom-label" style="color:#aaa; font-size:12px;">Zoom: 100%</span>
-        <button id="btn-reset-view" title="Ansicht zurücksetzen (100%, keine Verschiebung)">⤢ Ansicht</button>
+        <button id="btn-reset-view" title="Ansicht zurücksetzen (Standard-Zoom, keine Verschiebung)">⤢ Ansicht</button>
       </div>
       <div class="group section-divider">
-        <button id="btn-export" class="primary" style="width:auto; margin-top:0;" disabled>⬇ Als .stl exportieren</button>
-        <button id="btn-export-step" style="width:auto; margin-top:0;" disabled title="Exportiert das 3D-Modell als .step (STEP-Datei) - Standardformat für CAM/Fräs- und Drehmaschinen-Software">⬇ Als .step exportieren</button>
+        <button id="btn-export" class="primary" style="width:auto; margin-top:0;" disabled>⬇ Export .stl</button>
+        <button id="btn-export-step" style="width:auto; margin-top:0;" disabled title="Exportiert das 3D-Modell als .step (STEP-Datei) - Standardformat für CAM/Fräs- und Drehmaschinen-Software">⬇ Export .step</button>
         <button id="btn-export-dxf" style="width:auto; margin-top:0;" disabled title="Exportiert nur die aktuelle 2D-Skizze (ohne Höhen/Extrusion) als .dxf, z.B. für eine Laser-/Plotter-Vorlage einer einfachen Dichtung">⬇ Skizze als .dxf</button>
         <button id="btn-save-project" title="Skizze, Extrusion und Flächen-Features als bearbeitbare Projektdatei speichern">💾 Projekt speichern</button>
         <button id="btn-load-project" title="Zuvor gespeicherte Projektdatei laden">📂 Projekt öffnen</button>
@@ -62,6 +66,7 @@
           <button id="tool-origin" class="tool" title="Eckpunkt oder Mittelpunkt anklicken, um ihn als neuen Ursprung (0,0) zu setzen">⌂ Ursprung setzen</button>
           <button id="tool-edge3d" class="tool" title="Kante des 3D-Modells (rechts) anklicken und einen Rundungsradius eingeben, um sie abzurunden (Fillet). Mehrere Kanten können nacheinander gerundet werden.">⌒ 3D Kanten runden</button>
           <button id="tool-edge" class="tool" title="Linie einer Linienform anklicken (nahe einer Ecke), um dort einen Rundungsradius einzugeben">⌒ 2D Ecken abrunden</button>
+          <button id="tool-alignline" class="tool" title="Erst die Leitlinie anklicken, dann die Follow-Linie eines anderen Objekts - das Objekt der Follow-Linie dreht sich um seinen Mittelpunkt, bis beide Linien parallel sind">📐 Linie ausrichten</button>
         </div>
       </div>
     </div>
@@ -83,10 +88,8 @@
           <button id="tool-line" class="tool active" title="Linien zeichnen: klicken um Punkte zu setzen, Doppelklick oder Enter zum Schließen">✎ Linie</button>
           <button id="tool-circle" class="tool" title="Kreis zeichnen: klicken für Mittelpunkt, ziehen für Radius">○ Kreis</button>
           <button id="tool-rect" class="tool" title="Rechteck zeichnen: klicken für die erste Ecke, klicken für die gegenüberliegende Ecke">▭ Rechteck</button>
-          <button id="tool-poly3" class="tool" title="Dreieck zeichnen: klicken für Mittelpunkt, klicken für Radius/Ausrichtung">△ 3-Eck</button>
-          <button id="tool-poly5" class="tool" title="Fünfeck zeichnen: klicken für Mittelpunkt, klicken für Radius/Ausrichtung">⬠ 5-Eck</button>
-          <button id="tool-poly6" class="tool" title="Sechseck zeichnen: klicken für Mittelpunkt, klicken für Radius/Ausrichtung">⬡ 6-Eck</button>
-          <button id="tool-poly8" class="tool" title="Achteck zeichnen: klicken für Mittelpunkt, klicken für Radius/Ausrichtung">⏣ 8-Eck</button>
+          <button id="tool-polygon" class="tool" title="Regelmässiges Polygon zeichnen: rechts die Eckenzahl einstellen, klicken für Mittelpunkt, klicken für Radius/Ausrichtung">⬡ Polygon</button>
+          <button id="tool-heart" class="tool" title="Herz zeichnen: klicken für Mittelpunkt, klicken (bei Mausbewegung) für die Größe">♥</button>
           <button id="tool-text" class="tool" title="Text: rechts Schriftart/Größe/Breite einstellen, dann in die Skizze klicken (linker Rand der Grundlinie)">🔤 Text</button>
           <button id="tool-holecircle" class="tool" title="Lochkreis: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken">◎ Lochkreis</button>
           <button id="tool-splineprofile" class="tool" title="Vielkeilprofil (Evolventenverzahnung): Mittelpunkt anklicken, dann rechts die Profilparameter einstellen und mit „Profil erstellen“ übernehmen">⚙ Vielkeilprofil</button>
@@ -112,7 +115,7 @@
         <span id="face-edit-label">Formen auf dieser Fläche: „Aufaddieren“ = Erhebung, „Loch“ = Ausschnitt (echtes Boolean-Schneiden). Die 3D-Vorschau aktualisiert sich live - mit „✓ Übernehmen“ bestätigen.</span>
         <button id="btn-cancel-face-edit">✕ Abbrechen</button>
       </div>
-      <div id="sketch-hint">Linien-Tool: Punkte anklicken, mit Doppelklick oder Enter schließen. Alt+Klick auf eine bestehende Linie: als Referenzlinie übernehmen (nächstes Segment richtet sich an deren Winkel aus). Strg gedrückt halten: aktuellen Winkel fixieren, Länge kann an anderen Linien einschnappen oder sich mit einem beliebigen anderen Punkt (z.B. dem Startpunkt) auf gleiche Höhe/Breite ausrichten, unabhängig vom Snap-Raster. Umschalt (Shift) beim Setzen des Endpunkts gedrückt halten: biegt das gerade gesetzte Segment zu einem Bogen, Stärke/Richtung folgt der Maus - loslassen übernimmt die Biegung, weiter normal klicken (ohne Shift) für gerade Segmente (beliebig mischbar). Nachträglich lässt sich ein bereits gesetztes Segment so nicht mehr biegen. Kreis-Tool: Klick = Mittelpunkt, dann ziehen und klicken = Radius. Rechteck-Tool: Klick = erste Ecke, Klick = gegenüberliegende Ecke. Vieleck-Tools (3/5/6/8-Eck): Klick = Mittelpunkt, dann ziehen und klicken = Radius und Ausrichtung. Text-Tool: rechts Einstellungen wählen, dann klicken = linker Rand der Grundlinie. Lochkreis-Tool: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken - wechselt danach automatisch ins Punkte-Tool zur Feinjustierung. Vielkeilprofil-Tool: Mittelpunkt anklicken, rechts die Verzahnungsparameter einstellen (Live-Vorschau) und mit „Profil erstellen“ übernehmen - danach über „Bearbeiten“ in der Formen-Liste jederzeit mit neuen Parametern neu berechnen. Vor dem Übernehmen für jede Form im Formen-Optionsmenü „Loch“ oder „Aufaddieren“ sowie die eigene Höhe/Tiefe wählen. Auswahl-Tool: Strg+Klick fügt eine Form der Auswahl hinzu/entfernt sie, mehrere ausgewählte Formen lassen sich gemeinsam verschieben. R+Klick+Ziehen auf eine Form dreht sie stattdessen um ihren Mittelpunkt (Mittelpunkt-Tool, falls verschoben) - der Drehwinkel rastet dabei auf das Winkel-Raster ein (falls aktiv).Punkte-Tool: Eckpunkt oder Mittelpunkt anklicken, um die Koordinaten zu bearbeiten, oder anklicken und ziehen, um ihn direkt zu verschieben (rastet auf dem Snap-Raster ein). 2D Ecken abrunden-Tool (⌒): Linie einer Linienform nahe einer Ecke anklicken, um dort einen Rundungsradius einzugeben (0 oder leer = scharfe Ecke). Mausrad: Zoom. Mittlere Maustaste ziehen: Ansicht verschieben.</div>
+      <div id="sketch-hint"></div>
     </div>
 
     <div id="side-panel">
@@ -141,18 +144,24 @@
         <label title="Zusätzlicher Abstand zwischen den Buchstaben, kann auch negativ sein">Zeichenabstand (mm)
           <input type="number" id="text-spacing" value="0" step="0.1">
         </label>
-        <div class="button-row">
-          <button type="button" id="text-mode-extrude" class="side-btn active">⬆ Extrudieren</button>
-          <button type="button" id="text-mode-cut" class="side-btn">⬇ Wegschneiden</button>
-        </div>
-        <label id="text-height-row"><span id="text-height-label">Höhe (mm)</span>
-          <input type="number" id="text-height" value="3" min="0.1" step="0.5">
-        </label>
-        <div class="button-row" id="text-side-row">
-          <button type="button" id="text-side-top" class="side-btn active">Oben</button>
-          <button type="button" id="text-side-bottom" class="side-btn">Unten</button>
-        </div>
         <div id="text-font-status" style="font-size:11px; color:#aaa;"></div>
+        <div id="text-edit-actions" style="display:none; gap:6px; margin-top:4px;">
+          <button type="button" id="btn-text-apply" class="primary" style="width:auto; flex:1; margin-top:0;">✓ Änderungen übernehmen</button>
+          <button type="button" id="btn-text-cancel" style="flex:1;">✕ Fertig</button>
+        </div>
+      </div>
+      <div class="panel-block" id="polygon-panel-block" style="display:none">
+        <h3>Polygon</h3>
+        <label title="Anzahl der gleichmässig auf dem Kreis verteilten Eckpunkte">Anzahl Ecken
+          <input type="number" id="polygon-sides" value="6" min="3" max="100" step="1">
+        </label>
+        <label title="Eckenradius, einheitlich auf alle Ecken angewendet (0 = scharfe Ecke)">Rundung (mm)
+          <input type="number" id="polygon-fillet" value="0" min="0" step="0.5">
+        </label>
+        <div id="polygon-edit-actions" style="display:none; gap:6px; margin-top:4px;">
+          <button type="button" id="btn-polygon-apply" class="primary" style="width:auto; flex:1; margin-top:0;">✓ Änderungen übernehmen</button>
+          <button type="button" id="btn-polygon-cancel" style="flex:1;">✕ Fertig</button>
+        </div>
       </div>
       <div class="panel-block" id="holecircle-panel-block" style="display:none">
         <h3>Lochkreis</h3>
@@ -168,6 +177,15 @@
       </div>
       <div class="panel-block" id="splineprofile-panel-block" style="display:none">
         <h3>Vielkeilprofil (Evolventenverzahnung)</h3>
+        <label title="Legt fest, nach welchem geometrischen Prinzip die Verzahnung berechnet wird - siehe Hinweis je Standard weiter unten">Profilstandard
+          <select id="splineprofile-standard">
+            <option value="custom" selected>Benutzerdefiniert</option>
+            <option value="din5480">DIN 5480</option>
+            <option value="iso4156">ISO 4156</option>
+            <option value="din5481">DIN 5481 (Kerbverzahnung)</option>
+            <option value="iso14">ISO 14 (geradflankig)</option>
+          </select>
+        </label>
         <div class="button-row">
           <button type="button" id="splineprofile-mode-external" class="side-btn active">Außenverzahnung</button>
           <button type="button" id="splineprofile-mode-internal" class="side-btn">Innenverzahnung</button>
@@ -178,35 +196,118 @@
         <label>Mittelpunkt Y (mm)
           <input type="number" id="splineprofile-center-y" value="0" step="1">
         </label>
-        <label>Zähnezahl
-          <input type="number" id="splineprofile-teeth" value="20" min="3" step="1">
+        <label title="Standardmäßig 40, damit Innenverzahnung mit den übrigen Standardwerten sofort ein gültiges Profil ergibt (bei wenigen Zähnen kann eine Innenverzahnung mit voller Zahnkopfhöhe geometrisch unmöglich sein) - bei Bedarf anpassen">Zähnezahl
+          <input type="number" id="splineprofile-teeth" value="40" min="3" step="1">
         </label>
-        <label>Modul (mm)
-          <input type="number" id="splineprofile-module" value="2" min="0.01" step="0.1">
-        </label>
-        <label>Eingriffswinkel (°)
-          <input type="number" id="splineprofile-pressure-angle" value="20" min="1" max="60" step="0.5">
-        </label>
-        <div class="button-row">
-          <button type="button" id="splineprofile-angle-30" class="side-btn">30°</button>
-          <button type="button" id="splineprofile-angle-375" class="side-btn">37,5°</button>
-          <button type="button" id="splineprofile-angle-45" class="side-btn">45°</button>
+
+        <div id="splineprofile-group-custom">
+          <label>Modul (mm)
+            <input type="number" id="splineprofile-module" value="2" min="0.01" step="0.1">
+          </label>
+          <label>Eingriffswinkel (°)
+            <input type="number" id="splineprofile-pressure-angle" value="20" min="1" max="60" step="0.5">
+          </label>
+          <div class="button-row">
+            <button type="button" id="splineprofile-angle-30" class="side-btn">30°</button>
+            <button type="button" id="splineprofile-angle-375" class="side-btn">37,5°</button>
+            <button type="button" id="splineprofile-angle-45" class="side-btn">45°</button>
+          </div>
+          <label title="Leer/0 = automatisch aus Modul/Zähnezahl/Profilverschiebung berechnet">Kopfkreisdurchmesser (mm)
+            <input type="number" id="splineprofile-tip-diameter" value="" step="0.1" placeholder="automatisch">
+          </label>
+          <label title="Leer/0 = automatisch aus Modul/Zähnezahl/Profilverschiebung berechnet">Fußkreisdurchmesser (mm)
+            <input type="number" id="splineprofile-root-diameter" value="" step="0.1" placeholder="automatisch">
+          </label>
         </div>
+
+        <div id="splineprofile-group-din5480" style="display:none">
+          <label title="Eingabe - der Modul wird daraus zusammen mit der Zähnezahl berechnet">Bezugsdurchmesser (mm)
+            <input type="number" id="splineprofile-din-reference-diameter" value="40" min="0.1" step="0.1">
+          </label>
+          <label title="Berechnet aus Bezugsdurchmesser ÷ Zähnezahl - kein Eingabefeld">Modul (mm, berechnet)
+            <input type="number" id="splineprofile-din-module" value="" disabled>
+          </label>
+          <label title="Nach DIN 5480 fest auf 30° - kein Eingabefeld">Eingriffswinkel (°, fest)
+            <input type="number" id="splineprofile-din-pressure-angle" value="30" disabled>
+          </label>
+          <div style="font-size:11px; color:#aaa; margin-top:4px;">Geometrisch nach DIN-5480-Prinzip; Normtabellen und Toleranzprüfung nicht enthalten.</div>
+        </div>
+
+        <div id="splineprofile-group-iso4156" style="display:none">
+          <label>Modul (mm)
+            <input type="number" id="splineprofile-iso-module" value="1" min="0.01" step="0.1">
+          </label>
+          <label>Eingriffswinkel (°)
+            <select id="splineprofile-iso-pressure-angle">
+              <option value="30">30°</option>
+              <option value="37.5">37,5°</option>
+              <option value="45">45°</option>
+            </select>
+          </label>
+          <div style="font-size:11px; color:#aaa; margin-top:4px;">Geometrisch nach ISO-4156-Prinzip; Normtabellen und Toleranzprüfung nicht enthalten.</div>
+        </div>
+
+        <div id="splineprofile-group-din5481" style="display:none">
+          <label title="Nur zur Plausibilitätsprüfung - muss zwischen Fuß- und Kopfkreisdurchmesser liegen">Nenndurchmesser (mm)
+            <input type="number" id="splineprofile-din5481-nominal-diameter" value="40" min="0.1" step="0.1">
+          </label>
+          <label>Kopfkreisdurchmesser (mm)
+            <input type="number" id="splineprofile-din5481-tip-diameter" value="44" min="0.1" step="0.1">
+          </label>
+          <label>Fußkreisdurchmesser (mm)
+            <input type="number" id="splineprofile-din5481-root-diameter" value="36" min="0.1" step="0.1">
+          </label>
+          <label title="Winkelbreite der Lücke zwischen zwei Zähnen, konstant über den Radius (gerade Zahnflanken)">Lückenwinkel (°)
+            <input type="number" id="splineprofile-din5481-gap-angle" value="3" min="0.1" step="0.5">
+          </label>
+          <label title="Flache Abflachung statt scharfer Kante am Zahnkopf - 0 = keine">Kopf-Abflachung (mm, optional)
+            <input type="number" id="splineprofile-din5481-tip-flat" value="0" min="0" step="0.05">
+          </label>
+          <label title="Flache Abflachung statt scharfer Kante am Zahnfuß - 0 = keine (bei aktivem Fußradius ohne Wirkung)">Fuß-Abflachung (mm, optional)
+            <input type="number" id="splineprofile-din5481-root-flat" value="0" min="0" step="0.05">
+          </label>
+          <div style="font-size:11px; color:#aaa; margin-top:4px;">Geometrisch nach DIN-5481-Prinzip; Normtabellen und Toleranzprüfung nicht enthalten.</div>
+        </div>
+
+        <div id="splineprofile-group-iso14" style="display:none">
+          <label>Innendurchmesser (mm)
+            <input type="number" id="splineprofile-iso14-inner-diameter" value="60" min="0.1" step="0.1">
+          </label>
+          <label>Außendurchmesser (mm)
+            <input type="number" id="splineprofile-iso14-outer-diameter" value="68" min="0.1" step="0.1">
+          </label>
+          <label title="Bei Außenprofil die Breite des Zahns, bei Innenprofil die Breite der Nut - jeweils am mittleren Durchmesser">Zahnbreite bzw. Nutbreite (mm)
+            <input type="number" id="splineprofile-iso14-width" value="3" min="0.1" step="0.1">
+          </label>
+          <label title="Flache Abflachung statt scharfer Kante am Zahnkopf - 0 = keine">Kopf-Abflachung (mm, optional)
+            <input type="number" id="splineprofile-iso14-tip-flat" value="0" min="0" step="0.05">
+          </label>
+          <div style="font-size:11px; color:#aaa; margin-top:4px;">Geometrisch nach ISO-14-Prinzip; Normtabellen und Toleranzprüfung nicht enthalten.</div>
+        </div>
+
         <label title="Startwinkel des ersten Zahns, gegen den Uhrzeigersinn">Drehwinkel / Startwinkel (°)
           <input type="number" id="splineprofile-rotation" value="0" step="1">
         </label>
-        <label title="Profilverschiebungsfaktor x - 0 = kein Versatz">Profilverschiebung (x)
-          <input type="number" id="splineprofile-shift" value="0" step="0.05">
-        </label>
-        <label title="Leer/0 = automatisch aus Modul/Zähnezahl/Profilverschiebung berechnet">Kopfkreisdurchmesser (mm)
-          <input type="number" id="splineprofile-tip-diameter" value="" step="0.1" placeholder="automatisch">
-        </label>
-        <label title="Leer/0 = automatisch aus Modul/Zähnezahl/Profilverschiebung berechnet">Fußkreisdurchmesser (mm)
-          <input type="number" id="splineprofile-root-diameter" value="" step="0.1" placeholder="automatisch">
-        </label>
+        <div id="splineprofile-shift-row">
+          <label title="Profilverschiebungsfaktor x - 0 = kein Versatz">Profilverschiebung (x)
+            <input type="number" id="splineprofile-shift" value="0" step="0.05">
+          </label>
+        </div>
         <label title="Rundung am Zahnfuß - 0 = scharfe Kante">Fußradius (mm, optional)
           <input type="number" id="splineprofile-root-fillet" value="0" min="0" step="0.05">
         </label>
+
+        <div id="splineprofile-computed-block" style="font-size:11px; color:#bbb; margin-top:6px; line-height:1.6;">
+          <div><b>Berechnete Werte</b></div>
+          <div>Teilungswinkel: <span id="splineprofile-computed-pitchangle">–</span> °</div>
+          <div>Zahn-/Nutteilung: <span id="splineprofile-computed-circpitch">–</span> mm</div>
+          <div>Kopfkreisdurchmesser: <span id="splineprofile-computed-tip">–</span> mm</div>
+          <div>Fußkreisdurchmesser: <span id="splineprofile-computed-root">–</span> mm</div>
+          <div>Teilkreisdurchmesser: <span id="splineprofile-computed-pitch">–</span> mm</div>
+          <div>Grundkreisdurchmesser: <span id="splineprofile-computed-base">–</span> mm</div>
+          <div>Eingriffswinkel: <span id="splineprofile-computed-pressure">–</span> °</div>
+        </div>
+
         <div id="splineprofile-status" style="font-size:11px; color:#e06060; min-height:14px;"></div>
         <div style="display:flex; gap:6px; margin-top:4px;">
           <button type="button" id="btn-splineprofile-apply" class="primary" style="width:auto; flex:1; margin-top:0;">✓ Profil erstellen</button>
