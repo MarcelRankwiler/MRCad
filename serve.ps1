@@ -15,7 +15,7 @@
 # Then open the printed http://localhost:8080/ URL in a browser.
 
 param(
-  [int]$Port = 8080
+  [int]$Port = $(if ($env:PORT) { [int]$env:PORT } else { 8080 })
 )
 
 $root = $PSScriptRoot

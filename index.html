@@ -49,7 +49,7 @@
       </div>
       <div class="group section-divider">
         <button id="btn-export" class="primary" style="width:auto; margin-top:0;" disabled>⬇ Export .stl</button>
-        <button id="btn-export-step" style="width:auto; margin-top:0;" disabled title="Exportiert das 3D-Modell als .step (STEP-Datei) - Standardformat für CAM/Fräs- und Drehmaschinen-Software">⬇ Export .step</button>
+        <button id="btn-export-step" class="primary" style="width:auto; margin-top:0;" disabled title="Exportiert das 3D-Modell als .step (STEP-Datei) - Standardformat für CAM/Fräs- und Drehmaschinen-Software">⬇ Export .step</button>
         <button id="btn-export-dxf" style="width:auto; margin-top:0;" disabled title="Exportiert nur die aktuelle 2D-Skizze (ohne Höhen/Extrusion) als .dxf, z.B. für eine Laser-/Plotter-Vorlage einer einfachen Dichtung">⬇ Skizze als .dxf</button>
         <button id="btn-save-project" title="Skizze, Extrusion und Flächen-Features als bearbeitbare Projektdatei speichern">💾 Projekt speichern</button>
         <button id="btn-load-project" title="Zuvor gespeicherte Projektdatei laden">📂 Projekt öffnen</button>
@@ -111,7 +111,13 @@
     </div>
 
     <div id="sketch-pane" class="pane">
-      <div class="pane-title" id="sketch-pane-title">2D Skizze (Klicken zum Zeichnen)</div>
+      <div class="pane-title" id="sketch-pane-title-row">
+        <span id="sketch-pane-title">2D Skizze (Klicken zum Zeichnen)</span>
+        <span id="layer-order-controls">
+          <button id="btn-layer-up" type="button" title="Ausgewähltes Objekt eine Ebene nach oben schieben (vor andere Objekte)" disabled>⬆ Ebene</button>
+          <button id="btn-layer-down" type="button" title="Ausgewähltes Objekt eine Ebene nach unten schieben (hinter andere Objekte)" disabled>⬇ Ebene</button>
+        </span>
+      </div>
       <canvas id="sketch-canvas"></canvas>
       <div id="face-edit-controls" style="display:none">
         <span id="face-edit-label">Formen auf dieser Fläche: „Aufaddieren“ = Erhebung, „Loch“ = Ausschnitt (echtes Boolean-Schneiden). Die 3D-Vorschau aktualisiert sich live - mit „✓ Übernehmen“ bestätigen.</span>
@@ -176,6 +182,10 @@
         <label>Lochdurchmesser (mm)
           <input type="number" id="holecircle-diameter" value="5" min="0.1" step="0.5">
         </label>
+        <div id="holecircle-edit-actions" style="display:none; gap:6px; margin-top:4px;">
+          <button type="button" id="btn-holecircle-apply" class="primary" style="width:auto; flex:1; margin-top:0;">✓ Änderungen übernehmen</button>
+          <button type="button" id="btn-holecircle-cancel" style="flex:1;">✕ Fertig</button>
+        </div>
       </div>
       <div class="panel-block" id="splineprofile-panel-block" style="display:none">
         <h3>Vielkeilprofil (Evolventenverzahnung)</h3>

@@ -5,7 +5,8 @@
       "name": "mrcad-static-server",
       "runtimeExecutable": "powershell",
       "runtimeArgs": ["-ExecutionPolicy", "Bypass", "-File", "serve.ps1"],
-      "port": 8080
+      "port": 8080,
+      "autoPort": true
     }
   ]
 }

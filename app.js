@@ -26,6 +26,7 @@ let splineProfileCenter = null; // in-progress Vielkeilprofil tool: center place
 let splineProfileEditId = null; // id of an existing 'splineprofile' shape currently bound to the panel for post-hoc editing (via the shape list's "Bearbeiten" button), or null
 let polygonEditId = null; // id of an existing 'polygon' shape currently bound to the panel for post-hoc editing (via the shape list's "Bearbeiten" button), or null - see openPolygonEditor()
 let textEditGroupId = null; // groupId of an existing 'text' shape group currently bound to the panel for post-hoc editing (via the shape list's "Bearbeiten" button), or null - see openTextEditor()
+let holecircleEditGroupId = null; // groupId of an existing 'holecircle' shape group currently bound to the panel for post-hoc editing (via the shape list's "Bearbeiten" button), or null - see openHoleCircleEditor()
 let mousePos = null;      // current mouse position (canvas space), for previews
 let selectedShapeIds = new Set(); // Ctrl/Cmd-click adds/removes a shape in the 'select' tool, for multi-drag/multi-edit
 let selectedSegment = null; // 'lineselect' tool: {shapeId, segIndex} of the currently picked edge, or null - Delete opens the shape at that edge
@@ -184,6 +185,8 @@ const angleStepInput = document.getElementById('angle-step');
 const angleOnInput = document.getElementById('angle-on');
 const rasterDistanceInput = document.getElementById('raster-distance-on');
 const shapeListEl = document.getElementById('shape-list');
+const btnLayerUp = document.getElementById('btn-layer-up');
+const btnLayerDown = document.getElementById('btn-layer-down');
 const extrudeStatusEl = document.getElementById('extrude-status');
 const btnExtrude = document.getElementById('btn-extrude');
 const btnExport = document.getElementById('btn-export');
@@ -302,14 +305,113 @@ function regularPolygonPoints(center, radius, sides, angleOffset) {
 // (world space) for a bolt-circle pattern around `center` - evenly spaced,
 // starting straight up (common bolt-pattern convention).
 function holeCirclePieces(center) {
-  const radius = Math.max(0, parseFloat(document.getElementById('holecircle-radius').value) || 0);
-  const count = Math.max(1, Math.round(parseFloat(document.getElementById('holecircle-count').value) || 1));
+  const { radius, count } = holeCirclePanelParams();
   const centers = [];
   for (let i = 0; i < count; i++) {
     const angle = -Math.PI / 2 + (i * 2 * Math.PI) / count;
     centers.push({ x: center.x + radius * Math.cos(angle), y: center.y + radius * Math.sin(angle) });
   }
   return centers;
+}
+
+// Reads the Lochkreis panel's radius/count/hole-diameter fields as a group -
+// used both when placing a new pattern and when applying edits to an
+// existing one (see openHoleCircleEditor/btn-holecircle-apply).
+function holeCirclePanelParams() {
+  const radius = Math.max(0, parseFloat(document.getElementById('holecircle-radius').value) || 0);
+  const count = Math.max(1, Math.round(parseFloat(document.getElementById('holecircle-count').value) || 1));
+  const holeRadius = Math.max(0.05, (parseFloat(document.getElementById('holecircle-diameter').value) || 5) / 2);
+  return { radius, count, holeRadius };
+}
+
+// Shown while placing a new hole-circle pattern (currentTool === 'holecircle')
+// or editing an existing group (holecircleEditGroupId set) - mirrors
+// updatePolygonPanelVisibility/updateTextPanelVisibility.
+function updateHolecirclePanelVisibility() {
+  if (holecircleEditGroupId != null && !shapes.some(s => s.groupId === holecircleEditGroupId && s.kind === 'holecircle')) {
+    holecircleEditGroupId = null;
+  }
+  const editing = holecircleEditGroupId != null;
+  document.getElementById('holecircle-panel-block').style.display = (currentTool === 'holecircle' || editing) ? 'block' : 'none';
+  document.getElementById('holecircle-edit-actions').style.display = editing ? 'flex' : 'none';
+}
+
+// Opens the panel bound to an existing hole-circle group, pre-filled from the
+// pattern params stored on its shapes when the pattern was created (or last
+// edited) - see the placement handler and btn-holecircle-apply below. Groups
+// saved before this field existed have no patternCenter on their shapes, so
+// those groups simply have no "Bearbeiten" button (see renderShapeList) - only
+// "Aufteilen", which doesn't need it.
+function openHoleCircleEditor(groupId) {
+  const members = shapes.filter(s => s.groupId === groupId && s.kind === 'holecircle');
+  const shape = members[0];
+  if (!shape || shape.patternCenter == null) return;
+  document.getElementById('holecircle-radius').value = shape.patternRadius != null ? shape.patternRadius : 0;
+  document.getElementById('holecircle-count').value = shape.patternCount != null ? shape.patternCount : members.length;
+  document.getElementById('holecircle-diameter').value = shape.radius * 2;
+  holecircleEditGroupId = groupId;
+  updateHolecirclePanelVisibility();
+  render();
+}
+
+document.getElementById('btn-holecircle-apply').addEventListener('click', () => {
+  const groupId = holecircleEditGroupId;
+  const oldMembers = shapes.filter(s => s.groupId === groupId && s.kind === 'holecircle');
+  if (oldMembers.length === 0 || oldMembers[0].patternCenter == null) { holecircleEditGroupId = null; updateHolecirclePanelVisibility(); return; }
+  const center = oldMembers[0].patternCenter;
+  const pieces = holeCirclePieces(center);
+  if (pieces.length === 0) return;
+  pushHistory();
+  // Loch/Aufaddieren/Höhe/Tiefe/Seite aren't read from the panel here - they're
+  // carried over as-is from the group's current shapes, which the
+  // Formen-Liste row's own controls already keep in sync across every member
+  // (see shapesInGroup), same as the text editor's apply handler above.
+  const { isHole, isAdditive, additiveHeight, additiveSide, holeDepth } = oldMembers[0];
+  const { radius: patternRadius, count: patternCount, holeRadius } = holeCirclePanelParams();
+  oldMembers.forEach(sh => selectedShapeIds.delete(sh.id));
+  shapes = shapes.filter(s => s.groupId !== groupId);
+  pieces.forEach(c => {
+    shapes.push({
+      id: nextShapeId++,
+      type: 'circle',
+      kind: 'holecircle',
+      groupId,
+      center: c,
+      radius: holeRadius,
+      patternCenter: center,
+      patternRadius,
+      patternCount,
+      isHole, isAdditive, additiveHeight, additiveSide, holeDepth,
+    });
+  });
+  selectedShapeIds = new Set(shapes.filter(s => s.groupId === groupId).map(s => s.id));
+  holecircleEditGroupId = null;
+  onShapesChanged();
+  updateHolecirclePanelVisibility();
+  render();
+});
+
+document.getElementById('btn-holecircle-cancel').addEventListener('click', () => {
+  holecircleEditGroupId = null;
+  updateHolecirclePanelVisibility();
+  render();
+});
+
+// "Aufteilen": turns a hole-circle group into fully independent holes -
+// clears groupId (and the now-meaningless pattern params) on every member, so
+// they no longer move/rotate together, share Loch/Aufaddieren/Höhe/Seite
+// edits, or collapse into one Formen-Liste row (see shapesInGroup/
+// renderShapeList). Irreversible other than via undo.
+function splitHoleCircleGroup(groupId) {
+  pushHistory();
+  shapes.filter(s => s.groupId === groupId && s.kind === 'holecircle').forEach(s => {
+    delete s.groupId;
+    delete s.patternCenter;
+    delete s.patternRadius;
+    delete s.patternCount;
+  });
+  onShapesChanged();
+  render();
 }
 
 // Outline of a heart shape (classic parametric heart curve), centered on
@@ -1357,6 +1459,8 @@ function render() {
   // finished shapes
   shapes.forEach(shape => drawShape(shape, selectedShapeIds.has(shape.id), shape.id === errorShapeId));
 
+  updateLayerButtons();
+
   if (currentTool === 'dimension') drawDimensionLabels();
   if (currentTool === 'point' || currentTool === 'origin') drawPointHandles();
   if (currentTool === 'centerpoint') drawCenterPivotHandles();
@@ -2063,11 +2167,12 @@ function setTool(tool) {
   }
   document.querySelectorAll('.tool').forEach(b => b.classList.remove('active'));
   document.getElementById('tool-' + tool).classList.add('active');
-  document.getElementById('holecircle-panel-block').style.display = (tool === 'holecircle') ? 'block' : 'none';
   textEditGroupId = null;
   updateTextPanelVisibility();
   polygonEditId = null;
   updatePolygonPanelVisibility();
+  holecircleEditGroupId = null;
+  updateHolecirclePanelVisibility();
   splineProfileEditId = null;
   updateSplineProfilePanelVisibility();
   if (tool !== 'lineselect') selectedSegment = null;
@@ -2813,6 +2918,7 @@ canvas.addEventListener('click', (evt) => {
       pushHistory();
       const groupId = nextShapeId;
       const side = defaultAdditiveSide();
+      const { radius: patternRadius, count: patternCount, holeRadius } = holeCirclePanelParams();
       pieces.forEach(center => {
         shapes.push({
           id: nextShapeId++,
@@ -2820,7 +2926,14 @@ canvas.addEventListener('click', (evt) => {
           kind: 'holecircle',
           groupId,
           center,
-          radius: Math.max(0.05, (parseFloat(document.getElementById('holecircle-diameter').value) || 5) / 2),
+          radius: holeRadius,
+          // Pattern params (not derivable from the individual hole centers alone) -
+          // kept so the whole group can be re-opened for editing later, see
+          // openHoleCircleEditor(). Cleared on "Aufteilen" (see splitHoleCircleGroup),
+          // at which point the holes become fully independent again.
+          patternCenter: p,
+          patternRadius,
+          patternCount,
           isHole: false,
           isAdditive: true,
           additiveHeight: 5,
@@ -2979,6 +3092,55 @@ function deleteShapes(ids) {
   onShapesChanged();
   render();
 }
+
+// Layer order = position in the `shapes` array: render() draws shapes.forEach
+// front-to-back-inverted (later = on top), and hitTestShape() walks the array
+// backwards (last = hit first), so moving a shape later/earlier in the array
+// is exactly "bring forward"/"send backward". Text/Lochkreis groups (shared
+// groupId, see shapesInGroup) move together as one block so letters/holes of
+// one placed object never get split apart by the reorder.
+function buildLayerUnits() {
+  const units = [];
+  const seenGroups = new Set();
+  shapes.forEach(s => {
+    if (s.groupId != null) {
+      if (seenGroups.has(s.groupId)) return;
+      seenGroups.add(s.groupId);
+      units.push(shapes.filter(sh => sh.groupId === s.groupId));
+    } else {
+      units.push([s]);
+    }
+  });
+  return units;
+}
+
+function selectedLayerUnitIndex(units) {
+  if (selectedShapeIds.size === 0) return -1;
+  return units.findIndex(u => u.some(sh => selectedShapeIds.has(sh.id)));
+}
+
+function updateLayerButtons() {
+  const units = buildLayerUnits();
+  const idx = selectedLayerUnitIndex(units);
+  btnLayerUp.disabled = idx === -1 || idx >= units.length - 1;
+  btnLayerDown.disabled = idx === -1 || idx <= 0;
+}
+
+function moveSelectedLayer(dir) {
+  const units = buildLayerUnits();
+  const idx = selectedLayerUnitIndex(units);
+  const swapWith = idx + dir;
+  if (idx === -1 || swapWith < 0 || swapWith >= units.length) return;
+  pushHistory();
+  [units[idx], units[swapWith]] = [units[swapWith], units[idx]];
+  shapes = units.flat();
+  onShapesChanged();
+  render();
+  renderShapeList();
+}
+
+btnLayerUp.addEventListener('click', () => moveSelectedLayer(1));
+btnLayerDown.addEventListener('click', () => moveSelectedLayer(-1));
 
 // Background images don't participate in extrusion/history (see backgroundImages
 // declaration), so unlike deleteShapes() this doesn't call pushHistory()/markDirty().
@@ -3783,7 +3945,14 @@ function openFilletEditor(hit) {
 const SHAPE_KIND_LABELS = { rect: 'Rechteck', poly3: 'Dreieck', poly5: 'Fünfeck', poly6: 'Sechseck', poly8: 'Achteck', heart: 'Herz', text: 'Text' };
 
 function shapeLabel(s) {
-  if (s.kind === 'holecircle') return 'Lochkreis-Loch';
+  if (s.kind === 'holecircle') {
+    if (s.groupId != null) {
+      const count = shapes.filter(sh => sh.groupId === s.groupId).length;
+      const dia = (s.radius * 2).toFixed(1).replace(/\.0$/, '');
+      return `Lochkreis (${count}x ⌀${dia}mm)`;
+    }
+    return 'Lochkreis-Loch';
+  }
   if (s.type === 'circle') return 'Kreis';
   if (s.kind === 'polygon') return `Polygon (${s.sides || s.points.length}-Eck)${s.open ? ' (offen)' : ''}`;
   if (s.kind === 'text') return `Text „${s.textParams ? s.textParams.text : s.char}“`;
@@ -4114,19 +4283,23 @@ function renderShapeList() {
     shapeListEl.innerHTML = '<div class="empty">Noch keine Formen gezeichnet.</div>';
     return;
   }
-  // A placed text is many polygon shapes (one per glyph piece) sharing one
-  // groupId - shown here as a single row (see shapeLabel's textParams.text)
-  // so the list reads as "one form" per the user's mental model, matching
-  // how it's edited (openTextEditor) and deleted (whole group) below.
-  const seenTextGroups = new Set();
+  // A placed text is many polygon shapes (one per glyph piece), and a placed
+  // Lochkreis is many circle shapes (one per hole), sharing one groupId -
+  // shown here as a single row (see shapeLabel) so the list reads as "one
+  // form" per the user's mental model, matching how each is edited
+  // (openTextEditor/openHoleCircleEditor) and deleted (whole group) below. A
+  // Lochkreis that's been "aufgeteilt" has its groupId cleared and goes back
+  // to being listed as independent holes, same as before this grouping existed.
+  const isGroupRow = (s) => (s.kind === 'text' || s.kind === 'holecircle') && s.groupId != null;
+  const seenGroups = new Set();
   let visibleIdx = 0;
   shapes.forEach((s) => {
-    if (s.kind === 'text' && s.groupId != null) {
-      if (seenTextGroups.has(s.groupId)) return;
-      seenTextGroups.add(s.groupId);
+    if (isGroupRow(s)) {
+      if (seenGroups.has(s.groupId)) return;
+      seenGroups.add(s.groupId);
     }
     visibleIdx++;
-    const isSelected = s.kind === 'text' && s.groupId != null
+    const isSelected = isGroupRow(s)
       ? shapesInGroup(s).some(sh => selectedShapeIds.has(sh.id))
       : selectedShapeIds.has(s.id);
     const item = document.createElement('div');
@@ -4210,12 +4383,26 @@ function renderShapeList() {
       editBtn.addEventListener('click', () => openTextEditor(s.groupId));
       controls.appendChild(editBtn);
     }
+    if (s.kind === 'holecircle' && s.groupId != null && s.patternCenter != null) {
+      const editBtn = document.createElement('button');
+      editBtn.textContent = '✏ Bearbeiten';
+      editBtn.title = 'Radius, Anzahl und Durchmesser dieses Lochkreises nachträglich ändern';
+      editBtn.addEventListener('click', () => openHoleCircleEditor(s.groupId));
+      controls.appendChild(editBtn);
+    }
+    if (s.kind === 'holecircle' && s.groupId != null) {
+      const splitBtn = document.createElement('button');
+      splitBtn.textContent = '✂ Aufteilen';
+      splitBtn.title = 'Löcher als unabhängige Einzelformen ohne Bezug zueinander auftrennen';
+      splitBtn.addEventListener('click', () => splitHoleCircleGroup(s.groupId));
+      controls.appendChild(splitBtn);
+    }
 
     const delBtn = document.createElement('button');
     delBtn.textContent = '✕';
     delBtn.title = 'Form löschen';
     delBtn.addEventListener('click', () => {
-      if (s.kind === 'text' && s.groupId != null) deleteShapes(shapesInGroup(s).map(sh => sh.id));
+      if (isGroupRow(s)) deleteShapes(shapesInGroup(s).map(sh => sh.id));
       else deleteShape(s.id);
     });
     controls.appendChild(delBtn);
@@ -4223,7 +4410,7 @@ function renderShapeList() {
     row.appendChild(controls);
     row.addEventListener('click', (e) => {
       if (e.target === delBtn || e.target === holeCheckbox || e.target === addCheckbox) return;
-      const rowIds = s.kind === 'text' && s.groupId != null ? shapesInGroup(s).map(sh => sh.id) : [s.id];
+      const rowIds = isGroupRow(s) ? shapesInGroup(s).map(sh => sh.id) : [s.id];
       if (e.ctrlKey || e.metaKey) {
         if (rowIds.every(id => selectedShapeIds.has(id))) rowIds.forEach(id => selectedShapeIds.delete(id));
         else rowIds.forEach(id => selectedShapeIds.add(id));
