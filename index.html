@@ -56,43 +56,45 @@
         <input type="file" id="load-project-input" accept=".mrcad,.json" style="display:none">
       </div>
     </div>
-    <div class="toolbar-row">
-      <div class="tool-tab">
-        <span class="tool-tab-label">Spezial</span>
-        <div class="group">
-          <button id="tool-dimension" class="tool" title="Auf eine Linie oder einen Kreis klicken, um Länge/Radius einzugeben. Strg gedrückt halten: erst einen Punkt oder eine Linie als fixe Referenz anklicken, dann den zu treibenden Punkt/Linie - danach im Lineal den Abstand eingeben.">📏 Maße</button>
-          <button id="tool-alignline" class="tool" title="Erst die Leitlinie anklicken, dann die Follow-Linie eines anderen Objekts - das Objekt der Follow-Linie dreht sich um seinen Mittelpunkt, bis beide Linien parallel sind">📐 Linie ausrichten</button>
-          <button id="btn-insert-bg-image" title="Hintergrundbild (JPG/PNG) als Zeichenvorlage in die aktuelle Skizze einfügen - liegt hinter dem Raster. Mit dem Auswahl-Tool verschieben oder an den 4 Ecken frei skalieren. Bei einer neuen Skizze auf einer Fläche ist kein Bild vorhanden.">🖼 Hintergrundbild einfügen</button>
-          <input type="file" id="bg-image-input" accept="image/*" style="display:none">
-          <button id="tool-origin" class="tool" title="Eckpunkt oder Mittelpunkt anklicken, um ihn als neuen Ursprung (0,0) zu setzen">⌂ Ursprung setzen</button>
-          <button id="tool-edge3d" class="tool" title="Kante des 3D-Modells (rechts) anklicken und einen Rundungsradius eingeben, um sie abzurunden (Fillet). Mehrere Kanten können nacheinander gerundet werden.">⌒ 3D Kanten runden</button>
-          <button id="tool-edge" class="tool" title="Linie einer Linienform anklicken (nahe einer Ecke), um dort einen Rundungsradius einzugeben">⌒ 2D Ecken abrunden</button>
+    <div class="tool-tab-group">
+      <div class="toolbar-row">
+        <div class="tool-tab">
+          <span class="tool-tab-label">Spezial</span>
+          <div class="group">
+            <button id="tool-dimension" class="tool" title="Auf eine Linie oder einen Kreis klicken, um Länge/Radius einzugeben. Strg gedrückt halten: erst einen Punkt oder eine Linie als fixe Referenz anklicken, dann den zu treibenden Punkt/Linie - danach im Lineal den Abstand eingeben.">📏 Maße</button>
+            <button id="tool-alignline" class="tool" title="Erst die Leitlinie anklicken, dann die Follow-Linie eines anderen Objekts - das Objekt der Follow-Linie dreht sich um seinen Mittelpunkt, bis beide Linien parallel sind">📐 Linie ausrichten</button>
+            <button id="btn-insert-bg-image" title="Hintergrundbild (JPG/PNG) als Zeichenvorlage in die aktuelle Skizze einfügen - liegt hinter dem Raster. Mit dem Auswahl-Tool verschieben oder an den 4 Ecken frei skalieren. Bei einer neuen Skizze auf einer Fläche ist kein Bild vorhanden.">🖼 Hintergrundbild einfügen</button>
+            <input type="file" id="bg-image-input" accept="image/*" style="display:none">
+            <button id="tool-origin" class="tool" title="Eckpunkt oder Mittelpunkt anklicken, um ihn als neuen Ursprung (0,0) zu setzen">⌂ Ursprung setzen</button>
+            <button id="tool-edge3d" class="tool" title="Kante des 3D-Modells (rechts) anklicken und einen Rundungsradius eingeben, um sie abzurunden (Fillet). Mehrere Kanten können nacheinander gerundet werden.">⌒ 3D Kanten runden</button>
+            <button id="tool-edge" class="tool" title="Linie einer Linienform anklicken (nahe einer Ecke), um dort einen Rundungsradius einzugeben">⌒ 2D Ecken abrunden</button>
+          </div>
         </div>
       </div>
-    </div>
-    <div class="toolbar-row">
-      <div class="tool-tab">
-        <span class="tool-tab-label">Auswahl</span>
-        <div class="group">
-          <button id="tool-select" class="tool" title="Form(en) auswählen und verschieben. Strg+Klick: mehrere Formen zur Auswahl hinzufügen/entfernen. R+Klick+Ziehen: Form um ihren Mittelpunkt drehen, Winkel rastet auf das Winkel-Raster ein">↖ Objekt</button>
-          <button id="tool-lineselect" class="tool" title="Einzelne Linie einer Linienform anklicken, um sie auszuwählen - Entf/Backspace löscht die Linie und öffnet die Form. Danach mit dem Linien-Werkzeug wieder verschliessen.">╱ Linie</button>
-          <button id="tool-centerpoint" class="tool" title="Mittelpunkt-Marker eines Kreises, Vielecks oder einer Gruppe anklicken und ziehen, um NUR diesen Marker zu verschieben - die Form selbst bleibt an Ort und Stelle (Snap-Raster). Gedacht als späterer Dreh-Mittelpunkt. Anklicken ohne Ziehen: Marker-Koordinaten bearbeiten.">⊙ Mittelpunkt</button>
-          <button id="tool-point" class="tool" title="Eckpunkte einer Linienform oder den Mittelpunkt einer Form anklicken, um die Welt-Koordinaten anzuzeigen und zu bearbeiten - oder anklicken und ziehen, um direkt zu verschieben (Snap-Raster)">⌖ Punkte</button>
+      <div class="toolbar-row">
+        <div class="tool-tab">
+          <span class="tool-tab-label">Auswahl</span>
+          <div class="group">
+            <button id="tool-select" class="tool" title="Form(en) auswählen und verschieben. Strg+Klick: mehrere Formen zur Auswahl hinzufügen/entfernen. R+Klick+Ziehen: Form um ihren Mittelpunkt drehen, Winkel rastet auf das Winkel-Raster ein">↖ Objekt</button>
+            <button id="tool-lineselect" class="tool" title="Einzelne Linie einer Linienform anklicken, um sie auszuwählen - Entf/Backspace löscht die Linie und öffnet die Form. Danach mit dem Linien-Werkzeug wieder verschliessen.">╱ Linie</button>
+            <button id="tool-centerpoint" class="tool" title="Mittelpunkt-Marker eines Kreises, Vielecks oder einer Gruppe anklicken und ziehen, um NUR diesen Marker zu verschieben - die Form selbst bleibt an Ort und Stelle (Snap-Raster). Gedacht als späterer Dreh-Mittelpunkt. Anklicken ohne Ziehen: Marker-Koordinaten bearbeiten.">⊙ Mittelpunkt</button>
+            <button id="tool-point" class="tool" title="Eckpunkte einer Linienform oder den Mittelpunkt einer Form anklicken, um die Welt-Koordinaten anzuzeigen und zu bearbeiten - oder anklicken und ziehen, um direkt zu verschieben (Snap-Raster)">⌖ Punkte</button>
+          </div>
         </div>
       </div>
-    </div>
-    <div class="toolbar-row">
-      <div class="tool-tab">
-        <span class="tool-tab-label">Zeichnen</span>
-        <div class="group">
-          <button id="tool-line" class="tool active" title="Linien zeichnen: klicken um Punkte zu setzen, Doppelklick oder Enter zum Schließen">✎ Linie</button>
-          <button id="tool-circle" class="tool" title="Kreis zeichnen: klicken für Mittelpunkt, ziehen für Radius">○ Kreis</button>
-          <button id="tool-rect" class="tool" title="Rechteck zeichnen: klicken für die erste Ecke, klicken für die gegenüberliegende Ecke">▭ Rechteck</button>
-          <button id="tool-polygon" class="tool" title="Regelmässiges Polygon zeichnen: rechts die Eckenzahl einstellen, klicken für Mittelpunkt, klicken für Radius/Ausrichtung">⬡ Polygon</button>
-          <button id="tool-heart" class="tool" title="Herz zeichnen: klicken für Mittelpunkt, klicken (bei Mausbewegung) für die Größe">♥</button>
-          <button id="tool-text" class="tool" title="Text: rechts Schriftart/Größe/Breite einstellen, dann in die Skizze klicken (linker Rand der Grundlinie)">🔤 Text</button>
-          <button id="tool-holecircle" class="tool" title="Lochkreis: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken">◎ Lochkreis</button>
-          <button id="tool-splineprofile" class="tool" title="Vielkeilprofil (Evolventenverzahnung): Mittelpunkt anklicken, dann rechts die Profilparameter einstellen und mit „Profil erstellen“ übernehmen">⚙ Vielkeilprofil</button>
+      <div class="toolbar-row">
+        <div class="tool-tab">
+          <span class="tool-tab-label">Zeichnen</span>
+          <div class="group">
+            <button id="tool-line" class="tool active" title="Linien zeichnen: klicken um Punkte zu setzen, Doppelklick oder Enter zum Schließen">✎ Linie</button>
+            <button id="tool-circle" class="tool" title="Kreis zeichnen: klicken für Mittelpunkt, ziehen für Radius">○ Kreis</button>
+            <button id="tool-rect" class="tool" title="Rechteck zeichnen: klicken für die erste Ecke, klicken für die gegenüberliegende Ecke">▭ Rechteck</button>
+            <button id="tool-polygon" class="tool" title="Regelmässiges Polygon zeichnen: rechts die Eckenzahl einstellen, klicken für Mittelpunkt, klicken für Radius/Ausrichtung">⬡ Polygon</button>
+            <button id="tool-heart" class="tool" title="Herz zeichnen: klicken für Mittelpunkt, klicken (bei Mausbewegung) für die Größe">♥</button>
+            <button id="tool-text" class="tool" title="Text: rechts Schriftart/Größe/Breite einstellen, dann in die Skizze klicken (linker Rand der Grundlinie)">🔤 Text</button>
+            <button id="tool-holecircle" class="tool" title="Lochkreis: rechts Radius/Anzahl/Durchmesser einstellen, dann Mittelpunkt anklicken">◎ Lochkreis</button>
+            <button id="tool-splineprofile" class="tool" title="Vielkeilprofil (Evolventenverzahnung): Mittelpunkt anklicken, dann rechts die Profilparameter einstellen und mit „Profil erstellen“ übernehmen">⚙ Vielkeilprofil</button>
+          </div>
         </div>
       </div>
     </div>

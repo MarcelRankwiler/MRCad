@@ -21,20 +21,28 @@ html, body { margin: 0; height: 100%; font-family: -apple-system, Segoe UI, Aria
   flex-shrink: 0;
 }
 #toolbar .toolbar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 24px; }
-#toolbar .toolbar-row:not(.toolbar-row-main) { padding-left: calc(18px + 8px); }
 #toolbar .group { display: flex; align-items: center; gap: 6px; }
 #toolbar .group.section-divider { margin-left: auto; padding-left: 24px; border-left: 1px solid #3a3b3e; }
 #toolbar label { font-size: 13px; display: flex; align-items: center; gap: 4px; color: #b8b8b8; }
 #toolbar .logo { font-size: 18px; font-weight: 700; letter-spacing: 0.03em; color: #4a7dfc; margin-right: 8px; }
 
+#toolbar .tool-tab-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 10px 6px 4px;
+  background: #232427;
+  border: 1px solid #35363a;
+  border-radius: 6px;
+}
+#toolbar .tool-tab-group .toolbar-row:not(:last-child) {
+  padding-bottom: 6px;
+  border-bottom: 1px solid #2c2d30;
+}
 #toolbar .tool-tab {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 10px 4px 4px;
-  background: #232427;
-  border: 1px solid #35363a;
-  border-radius: 6px;
 }
 #toolbar .tool-tab-label {
   font-size: 11px;
@@ -58,6 +66,7 @@ button {
   padding: 6px 12px;
   cursor: pointer;
   font-size: 13px;
+  line-height: 1.2;
 }
 button:hover { background: #46474a; }
 button.active { background: #4a7dfc; border-color: #4a7dfc; color: white; }
