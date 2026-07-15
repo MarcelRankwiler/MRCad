@@ -1465,7 +1465,7 @@ function render() {
   if (currentTool === 'point' || currentTool === 'origin') drawPointHandles();
   if (currentTool === 'centerpoint') drawCenterPivotHandles();
   if (currentTool === 'edge') drawEdgeHandles();
-  if (currentTool === 'select') drawBackgroundImageHandles();
+  if (currentTool === 'select') { drawBackgroundImageHandles(); drawObjectCenterHandles(); }
   if (currentTool === 'lineselect') drawLineSelectHandles();
   if (currentTool === 'alignline') drawAlignLineHandles();
   if (currentTool === 'dimension' && (dimCtrlHeld || distanceFixedSel)) drawDistanceHandles();
@@ -1874,6 +1874,21 @@ function drawPointHandles() {
 // (see effectivePivot) - plus each group's shared marker (teal, groupPivotOf).
 // Kept separate from drawPointHandles()/centroidOf(), which the Punkte tool
 // still uses to mean "the shape's actual position".
+// Objekt (select) tool: passively shows each shape's center (orange, same
+// convention as centroidOf() in drawPointHandles) plus each group's shared
+// center (teal), without making them clickable/draggable handles.
+function drawObjectCenterHandles() {
+  const shownGroupCenters = new Set();
+  shapes.forEach(s => {
+    dot(centroidOf(s), '#ff9f4a', 5);
+    if (s.groupId != null && !shownGroupCenters.has(s.groupId)) {
+      shownGroupCenters.add(s.groupId);
+      const c = groupCenterOf(s.groupId);
+      if (c) dot(c, '#37e6b3', 6);
+    }
+  });
+}
+
 function drawCenterPivotHandles() {
   const shownGroups = new Set();
   shapes.forEach(s => {
